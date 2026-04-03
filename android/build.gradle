@@ -1,0 +1,96 @@
+// flutter_librsync Android build
+//
+// Native code is built via the Makefile in the plugin root using the Android
+// NDK.  Prebuilt .so files land in prebuilt/android/<abi>/ and are bundled
+// into the AAR by the jniLibs source-set below.
+//
+// Set ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) in your environment before
+// building.  Android Studio usually provides it automatically.
+
+group = "com.example.flutter_librsync"
+version = "1.0"
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.11.1")
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+
+android {
+    namespace = "com.example.flutter_librsync"
+    compileSdk = 36
+    ndkVersion = android.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        minSdk = 24
+    }
+
+    sourceSets {
+        main {
+            // Prebuilt .so files produced by `make android`
+            jniLibs.srcDirs = ['../prebuilt/android']
+        }
+    }
+}
+
+// ─── Build Go native libraries before Android packaging ──────────────────────
+
+def pluginRoot = file("${project.projectDir}/..")
+def prebuiltDir = file("${pluginRoot}/prebuilt/android")
+
+def ndkHome = System.getenv("ANDROID_NDK_HOME")
+    ?: System.getenv("ANDROID_NDK_ROOT")
+    ?: android.ndkDirectory?.absolutePath
+
+task buildGoAndroid {
+    description = "Build libflutter_librsync.so for all Android ABIs via the Makefile."
+
+    def outputs = [
+        file("${prebuiltDir}/arm64-v8a/libflutter_librsync.so"),
+        file("${prebuiltDir}/armeabi-v7a/libflutter_librsync.so"),
+        file("${prebuiltDir}/x86_64/libflutter_librsync.so"),
+    ]
+
+    // Declare inputs so Gradle skips this task when nothing has changed.
+    inputs.dir(file("${pluginRoot}/go"))
+    this.outputs.files(outputs)
+
+    doLast {
+        def makeExe = ["which", "make"].execute().text.trim()
+        if (!makeExe) {
+            throw new GradleException(
+                "make not found. Install build-essential (Linux) or Xcode Command Line Tools (macOS).")
+        }
+
+        if (!ndkHome) {
+            throw new GradleException(
+                "ANDROID_NDK_HOME is not set. Cannot build Go Android libraries.")
+        }
+
+        exec {
+            workingDir pluginRoot
+            environment("ANDROID_NDK_HOME", ndkHome)
+            commandLine "make", "android"
+        }
+    }
+}
+
+preBuild.dependsOn buildGoAndroid
