@@ -1,0 +1,55 @@
+name: flutter_librsync
+description: >
+  Flutter FFI plugin wrapping librsync-go. Provides rsync signature,
+  delta and patch operations on Android, iOS, macOS, Linux, Windows,
+  and Flutter Web (via WebAssembly).
+version: 0.0.1
+homepage: https://github.com/gurupras/flutter-librsync
+
+environment:
+  sdk: ^3.10.4
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.3
+  plugin_platform_interface: ^2.0.2
+
+dev_dependencies:
+  ffigen: ^13.0.0
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      linux:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true
+      # Web uses dart:js_interop + WASM – no pluginClass registration needed
+      # because the implementation is selected via conditional Dart export.
+
+  # Serve the WASM binary and Go WASM runtime helper as Flutter web assets.
+  # In the consuming app's web/index.html, load them with:
+  #
+  #   <script src="assets/packages/flutter_librsync/web/wasm_exec.js"></script>
+  #   <script>
+  #     const go = new Go();
+  #     WebAssembly.instantiateStreaming(
+  #       fetch("assets/packages/flutter_librsync/web/librsync.wasm"),
+  #       go.importObject
+  #     ).then(r => go.run(r.instance));
+  #   </script>
+  # (The "assets/packages/..." prefix is how Flutter serves plugin assets on web.)
+  assets:
+    - web/librsync.wasm
+    - web/wasm_exec.js
