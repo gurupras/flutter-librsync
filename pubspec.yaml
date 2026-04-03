@@ -3,7 +3,7 @@ description: >
   Flutter FFI plugin wrapping librsync-go. Provides rsync signature,
   delta and patch operations on Android, iOS, macOS, Linux, Windows,
   and Flutter Web (via WebAssembly).
-version: 0.0.1
+version: 0.1.0
 homepage: https://github.com/gurupras/flutter-librsync
 
 environment:
