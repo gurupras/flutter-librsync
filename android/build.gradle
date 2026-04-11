@@ -63,7 +63,7 @@ def ndkHome = System.getenv("ANDROID_NDK_HOME")
 task buildGoAndroid {
     description = "Build libflutter_librsync.so for all Android ABIs via the Makefile."
 
-    def outputs = [
+    def outputFiles = [
         file("${prebuiltDir}/arm64-v8a/libflutter_librsync.so"),
         file("${prebuiltDir}/armeabi-v7a/libflutter_librsync.so"),
         file("${prebuiltDir}/x86_64/libflutter_librsync.so"),
@@ -71,7 +71,7 @@ task buildGoAndroid {
 
     // Declare inputs so Gradle skips this task when nothing has changed.
     inputs.dir(file("${pluginRoot}/go"))
-    this.outputs.files(outputs)
+    outputs.files(outputFiles)
 
     doLast {
         def makeExe = ["which", "make"].execute().text.trim()
