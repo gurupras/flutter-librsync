@@ -34,3 +34,6 @@ migrate_working_dir/
 
 # Local clang wrapper (needed on systems where Flutter can't find ld in the LLVM bin dir)
 .clang-wrapper/
+
+# Go build artifacts
+go/flutter-librsync
