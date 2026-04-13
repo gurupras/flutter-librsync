@@ -4,43 +4,16 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 
-typedef int64_t (*rs_read_fn_t)(void* ctx, uint8_t* buf, int64_t len);
-typedef int64_t (*rs_seek_fn_t)(void* ctx, int64_t offset, int32_t whence);
-typedef int64_t (*rs_write_fn_t)(void* ctx, const uint8_t* buf, int64_t len);
-
-// Sequential reader (no seek; used for signature input, new-data input, delta input)
+// Callback struct for random-access reads on the base file.
+// Dart allocates this with calloc and keeps it alive for the patch session.
 typedef struct {
-    rs_read_fn_t read;
-    void*        ctx;
-} rs_reader_t;
-
-// Seekable reader (used for patch base)
-typedef struct {
-    rs_read_fn_t read;
-    rs_seek_fn_t seek;
-    void*        ctx;
+    void* userdata;
+    int32_t (*read_at)(void* userdata, int64_t offset, uint8_t* buf, size_t len, size_t* bytes_read);
 } rs_read_seeker_t;
 
-// Writer (used for all outputs)
-typedef struct {
-    rs_write_fn_t write;
-    void*         ctx;
-} rs_writer_t;
-
-// Inline helpers to call through function pointers.
-// CGO does not allow calling C function pointers directly from Go,
-// so we use static inline trampolines.
-static inline int64_t _rs_read(rs_reader_t* r, uint8_t* buf, int64_t len) {
-    return r->read(r->ctx, buf, len);
-}
-static inline int64_t _rs_rs_read(rs_read_seeker_t* r, uint8_t* buf, int64_t len) {
-    return r->read(r->ctx, buf, len);
-}
-static inline int64_t _rs_seek(rs_read_seeker_t* r, int64_t offset, int32_t whence) {
-    return r->seek(r->ctx, offset, whence);
-}
-static inline int64_t _rs_write(rs_writer_t* w, const uint8_t* buf, int64_t len) {
-    return w->write(w->ctx, buf, len);
+// Trampoline so Go can call the function pointer without unsafe casts.
+static int32_t call_read_at(const rs_read_seeker_t* rs, int64_t offset, uint8_t* buf, size_t len, size_t* bytes_read) {
+    return rs->read_at(rs->userdata, offset, buf, len, bytes_read);
 }
 */
 import "C"
@@ -48,160 +21,407 @@ import "C"
 import (
 	"fmt"
 	"io"
+	"sync"
 	"unsafe"
 
 	librsync "github.com/balena-os/librsync-go"
+	"github.com/balena-os/librsync-go/ffi/adapter"
 )
 
-// cReader wraps rs_reader_t as an io.Reader.
-type cReader struct{ r *C.rs_reader_t }
+func main() {}
 
-func (r *cReader) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	n := C._rs_read(r.r, (*C.uint8_t)(unsafe.Pointer(&p[0])), C.int64_t(len(p)))
-	if n < 0 {
-		return 0, fmt.Errorf("read error: %d", n)
-	}
-	if n == 0 {
-		return 0, io.EOF
-	}
-	return int(n), nil
-}
+// ── Error codes ───────────────────────────────────────────────────────────────
 
-// cReadSeeker wraps rs_read_seeker_t as an io.ReadSeeker.
-type cReadSeeker struct{ r *C.rs_read_seeker_t }
+const (
+	errOK      = C.int32_t(0)
+	errArgs    = C.int32_t(-1)
+	errCorrupt = C.int32_t(-2)
+	errMem     = C.int32_t(-3)
+)
 
-func (r *cReadSeeker) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	n := C._rs_rs_read(r.r, (*C.uint8_t)(unsafe.Pointer(&p[0])), C.int64_t(len(p)))
-	if n < 0 {
-		return 0, fmt.Errorf("read error: %d", n)
-	}
-	if n == 0 {
-		return 0, io.EOF
-	}
-	return int(n), nil
-}
-
-func (r *cReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	n := C._rs_seek(r.r, C.int64_t(offset), C.int32_t(whence))
-	if n < 0 {
-		return 0, fmt.Errorf("seek error: %d", n)
-	}
-	return int64(n), nil
-}
-
-// cWriter wraps rs_writer_t as an io.Writer.
-type cWriter struct{ w *C.rs_writer_t }
-
-func (w *cWriter) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	n := C._rs_write(w.w, (*C.uint8_t)(unsafe.Pointer(&p[0])), C.int64_t(len(p)))
-	if n < 0 {
-		return 0, fmt.Errorf("write error: %d", n)
-	}
-	return int(n), nil
-}
-
-// librsync_signature generates an rsync signature.
+// librsync_strerror returns a static string for the given error code.
+// The returned pointer is valid forever; never call librsync_free on it.
 //
-// input    – sequential reader for the basis file
-// output   – writer for the signature data
-// blockLen – block length for checksumming (e.g. 2048)
-// strongLen – strong hash length in bytes (e.g. 32 for BLAKE2)
-// sigType  – magic number: BLAKE2_SIG_MAGIC (0x72730137) or MD4_SIG_MAGIC (0x72730136)
+//export librsync_strerror
+func librsync_strerror(code C.int32_t) *C.char {
+	switch code {
+	case errOK:
+		return C.CString("ok")
+	case errArgs:
+		return C.CString("invalid arguments")
+	case errCorrupt:
+		return C.CString("corrupt or unexpected input")
+	case errMem:
+		return C.CString("memory allocation failed")
+	default:
+		return C.CString("unknown error")
+	}
+}
+
+// ── Memory ────────────────────────────────────────────────────────────────────
+
+// librsync_free frees a buffer returned by this library.
 //
-// Returns NULL on success, or a heap-allocated C string describing the error.
-// The caller must free the returned string with librsync_free_string.
+//export librsync_free
+func librsync_free(ptr unsafe.Pointer) {
+	C.free(ptr)
+}
+
+// ── Handle registry ───────────────────────────────────────────────────────────
+
+var (
+	handles   = map[C.intptr_t]interface{}{}
+	handlesMu sync.Mutex
+	nextID    C.intptr_t = 1
+)
+
+func storeHandle(v interface{}) C.intptr_t {
+	handlesMu.Lock()
+	defer handlesMu.Unlock()
+	h := nextID
+	nextID++
+	handles[h] = v
+	return h
+}
+
+func loadHandle(h C.intptr_t) interface{} {
+	handlesMu.Lock()
+	defer handlesMu.Unlock()
+	return handles[h]
+}
+
+func dropHandle(h C.intptr_t) {
+	handlesMu.Lock()
+	defer handlesMu.Unlock()
+	delete(handles, h)
+}
+
+// ── Output helpers ────────────────────────────────────────────────────────────
+
+// cInput wraps a C pointer+length as a Go byte slice without copying.
+func cInput(ptr *C.uint8_t, n C.size_t) []byte {
+	if n == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(ptr)), int(n))
+}
+
+// setOutput copies data to C-heap memory and writes the pointer and length to
+// the caller's output parameters. Sets both to zero when data is nil/empty.
+// The caller must librsync_free the returned pointer.
+func setOutput(outPtr **C.uint8_t, outLen *C.size_t, data []byte) {
+	if len(data) == 0 {
+		*outPtr = nil
+		*outLen = 0
+		return
+	}
+	*outPtr = (*C.uint8_t)(C.CBytes(data))
+	*outLen = C.size_t(len(data))
+}
+
+// ── Batch API ─────────────────────────────────────────────────────────────────
+
+// librsync_signature generates a serialized signature from a complete file
+// buffer. The caller must librsync_free(*out_ptr).
 //
 //export librsync_signature
 func librsync_signature(
-	input *C.rs_reader_t,
-	output *C.rs_writer_t,
+	inputPtr *C.uint8_t, inputLen C.size_t,
 	blockLen, strongLen, sigType C.uint32_t,
-) *C.char {
-	_, err := librsync.Signature(
-		&cReader{r: input},
-		&cWriter{w: output},
-		uint32(blockLen),
-		uint32(strongLen),
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	result, err := adapter.SignatureBytes(
+		cInput(inputPtr, inputLen),
+		uint32(blockLen), uint32(strongLen),
 		librsync.MagicNumber(sigType),
 	)
 	if err != nil {
-		return C.CString(err.Error())
+		return errCorrupt
 	}
-	return nil
+	setOutput(outPtr, outLen, result)
+	return errOK
 }
 
-// librsync_delta generates a delta between a signature and new file data.
-//
-// sigInput – sequential reader for the signature produced by librsync_signature
-// newData  – sequential reader for the new (modified) file
-// output   – writer for the delta data
-//
-// Returns NULL on success, or a heap-allocated error string (free with librsync_free_string).
+// librsync_delta computes a delta from serialized signature bytes and a new
+// file buffer. The caller must librsync_free(*out_ptr).
 //
 //export librsync_delta
 func librsync_delta(
-	sigInput *C.rs_reader_t,
-	newData *C.rs_reader_t,
-	output *C.rs_writer_t,
-) *C.char {
-	sig, err := librsync.ReadSignature(&cReader{r: sigInput})
+	sigPtr *C.uint8_t, sigLen C.size_t,
+	inputPtr *C.uint8_t, inputLen C.size_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	sig, err := adapter.ParseSignature(cInput(sigPtr, sigLen))
 	if err != nil {
-		return C.CString(fmt.Sprintf("read signature: %v", err))
+		return errCorrupt
 	}
-	if err := librsync.Delta(sig, &cReader{r: newData}, &cWriter{w: output}); err != nil {
-		return C.CString(fmt.Sprintf("delta: %v", err))
+	result, err := adapter.DeltaBytes(sig, cInput(inputPtr, inputLen))
+	if err != nil {
+		return errCorrupt
 	}
-	return nil
+	setOutput(outPtr, outLen, result)
+	return errOK
 }
 
-// librsync_patch reconstructs a new file by applying a delta to a base file.
-//
-// base   – seekable reader for the basis file (must support random access)
-// delta  – sequential reader for the delta produced by librsync_delta
-// output – writer for the reconstructed file
-//
-// Returns NULL on success, or a heap-allocated error string (free with librsync_free_string).
+// librsync_patch applies a delta to a complete base file buffer.
+// The caller must librsync_free(*out_ptr).
 //
 //export librsync_patch
 func librsync_patch(
-	base *C.rs_read_seeker_t,
-	delta *C.rs_reader_t,
-	output *C.rs_writer_t,
-) *C.char {
-	if err := librsync.Patch(&cReadSeeker{r: base}, &cReader{r: delta}, &cWriter{w: output}); err != nil {
-		return C.CString(fmt.Sprintf("patch: %v", err))
+	basePtr *C.uint8_t, baseLen C.size_t,
+	deltaPtr *C.uint8_t, deltaLen C.size_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	result, err := adapter.PatchBytes(
+		cInput(basePtr, baseLen),
+		cInput(deltaPtr, deltaLen),
+	)
+	if err != nil {
+		return errCorrupt
 	}
-	return nil
+	setOutput(outPtr, outLen, result)
+	return errOK
 }
 
-// librsync_free_string frees a C string returned by any librsync_* function.
+// ── Parsed Signature Handle ───────────────────────────────────────────────────
+
+// librsync_sig_parse parses serialized signature bytes into an in-memory
+// structure. Returns a handle > 0 on success, 0 on failure.
 //
-//export librsync_free_string
-func librsync_free_string(s *C.char) {
-	C.free(unsafe.Pointer(s))
+//export librsync_sig_parse
+func librsync_sig_parse(sigPtr *C.uint8_t, sigLen C.size_t) C.intptr_t {
+	sig, err := adapter.ParseSignature(cInput(sigPtr, sigLen))
+	if err != nil {
+		return 0
+	}
+	return storeHandle(sig)
 }
 
-// librsync_blake2_sig_magic returns the BLAKE2 signature magic number.
+// librsync_sig_free frees a parsed signature handle.
 //
-//export librsync_blake2_sig_magic
-func librsync_blake2_sig_magic() C.uint32_t {
-	return C.uint32_t(librsync.BLAKE2_SIG_MAGIC)
+//export librsync_sig_free
+func librsync_sig_free(handle C.intptr_t) {
+	dropHandle(handle)
 }
 
-// librsync_md4_sig_magic returns the MD4 signature magic number (deprecated).
+// ── Streaming Signature ───────────────────────────────────────────────────────
+
+// librsync_signature_new creates a streaming signature session.
+// Returns a handle > 0 on success, 0 on failure.
 //
-//export librsync_md4_sig_magic
-func librsync_md4_sig_magic() C.uint32_t {
-	return C.uint32_t(librsync.MD4_SIG_MAGIC)
+//export librsync_signature_new
+func librsync_signature_new(blockLen, strongLen, sigType C.uint32_t) C.intptr_t {
+	sess, err := adapter.NewSignatureSession(
+		uint32(blockLen), uint32(strongLen),
+		librsync.MagicNumber(sigType),
+	)
+	if err != nil {
+		return 0
+	}
+	return storeHandle(sess)
 }
 
-func main() {}
+// librsync_signature_feed processes a chunk of input.
+// *out_ptr/*out_len receive any output produced; may be NULL/0 if the internal
+// buffer has not flushed yet. Caller must librsync_free(*out_ptr) if *out_len > 0.
+//
+//export librsync_signature_feed
+func librsync_signature_feed(
+	handle C.intptr_t,
+	inputPtr *C.uint8_t, inputLen C.size_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.SignatureSession)
+	if !ok {
+		return errArgs
+	}
+	result, err := sess.Feed(cInput(inputPtr, inputLen))
+	if err != nil {
+		return errCorrupt
+	}
+	setOutput(outPtr, outLen, result)
+	return errOK
+}
+
+// librsync_signature_end finalizes the session and returns any remaining output.
+// Always invalidates the handle — do NOT call librsync_signature_free after this.
+//
+//export librsync_signature_end
+func librsync_signature_end(
+	handle C.intptr_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.SignatureSession)
+	dropHandle(handle)
+	if !ok {
+		return errArgs
+	}
+	result, err := sess.End()
+	if err != nil {
+		return errCorrupt
+	}
+	setOutput(outPtr, outLen, result)
+	return errOK
+}
+
+// librsync_signature_free abandons the session without finalizing.
+//
+//export librsync_signature_free
+func librsync_signature_free(handle C.intptr_t) {
+	dropHandle(handle)
+}
+
+// ── Streaming Delta ───────────────────────────────────────────────────────────
+
+// librsync_delta_new creates a streaming delta session from a parsed signature.
+// Returns a handle > 0 on success, 0 on failure.
+//
+//export librsync_delta_new
+func librsync_delta_new(sigHandle C.intptr_t) C.intptr_t {
+	sig, ok := loadHandle(sigHandle).(*librsync.SignatureType)
+	if !ok {
+		return 0
+	}
+	sess, err := adapter.NewDeltaSession(sig)
+	if err != nil {
+		return 0
+	}
+	return storeHandle(sess)
+}
+
+// librsync_delta_feed processes a chunk of the new file.
+// *out_ptr/*out_len may be NULL/0 if the literal buffer has not yet flushed.
+//
+//export librsync_delta_feed
+func librsync_delta_feed(
+	handle C.intptr_t,
+	inputPtr *C.uint8_t, inputLen C.size_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.DeltaSession)
+	if !ok {
+		return errArgs
+	}
+	result, err := sess.Feed(cInput(inputPtr, inputLen))
+	if err != nil {
+		return errCorrupt
+	}
+	setOutput(outPtr, outLen, result)
+	return errOK
+}
+
+// librsync_delta_end finalizes the session and flushes remaining output.
+// Always invalidates the handle — do NOT call librsync_delta_free after this.
+//
+//export librsync_delta_end
+func librsync_delta_end(
+	handle C.intptr_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.DeltaSession)
+	dropHandle(handle)
+	if !ok {
+		return errArgs
+	}
+	result, err := sess.End()
+	if err != nil {
+		return errCorrupt
+	}
+	setOutput(outPtr, outLen, result)
+	return errOK
+}
+
+// librsync_delta_free abandons the session without finalizing.
+//
+//export librsync_delta_free
+func librsync_delta_free(handle C.intptr_t) {
+	dropHandle(handle)
+}
+
+// ── Streaming Patch ───────────────────────────────────────────────────────────
+
+// newCallbackReadAt wraps rs_read_seeker_t as an adapter.ReadAtFunc.
+// Inlined from ffi/internal/cbridge to avoid the internal package restriction.
+func newCallbackReadAt(rs *C.rs_read_seeker_t) adapter.ReadAtFunc {
+	return func(offset int64, buf []byte) (int, error) {
+		if len(buf) == 0 {
+			return 0, nil
+		}
+		var bytesRead C.size_t
+		ret := C.call_read_at(
+			rs,
+			C.int64_t(offset),
+			(*C.uint8_t)(unsafe.Pointer(&buf[0])),
+			C.size_t(len(buf)),
+			&bytesRead,
+		)
+		n := int(bytesRead)
+		if ret != 0 {
+			return n, fmt.Errorf("librsync: read_at callback returned error %d", ret)
+		}
+		if n == 0 {
+			return 0, io.EOF
+		}
+		return n, nil
+	}
+}
+
+// librsync_patch_new creates a streaming patch session. The rs_read_seeker_t
+// struct and its NativeCallable must remain valid until librsync_patch_end or
+// librsync_patch_free returns. Returns a handle > 0 on success, 0 on failure.
+//
+//export librsync_patch_new
+func librsync_patch_new(rs *C.rs_read_seeker_t) C.intptr_t {
+	if rs == nil || rs.read_at == nil {
+		return 0
+	}
+	readAt := newCallbackReadAt(rs)
+	sess := adapter.NewPatchSession(readAt)
+	return storeHandle(sess)
+}
+
+// librsync_patch_feed buffers a chunk of the delta stream.
+//
+//export librsync_patch_feed
+func librsync_patch_feed(
+	handle C.intptr_t,
+	deltaPtr *C.uint8_t, deltaLen C.size_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.PatchSession)
+	if !ok {
+		return errArgs
+	}
+	if err := sess.Feed(cInput(deltaPtr, deltaLen)); err != nil {
+		return errCorrupt
+	}
+	return errOK
+}
+
+// librsync_patch_end applies the buffered delta to the base file and returns
+// the reconstructed output. Always invalidates the handle.
+// Caller must librsync_free(*out_ptr) if *out_len > 0.
+//
+//export librsync_patch_end
+func librsync_patch_end(
+	handle C.intptr_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
+) C.int32_t {
+	sess, ok := loadHandle(handle).(*adapter.PatchSession)
+	dropHandle(handle)
+	if !ok {
+		return errArgs
+	}
+	result, err := sess.End()
+	if err != nil {
+		return errCorrupt
+	}
+	setOutput(outPtr, outLen, result)
+	return errOK
+}
+
+// librsync_patch_free abandons the session without applying the patch.
+//
+//export librsync_patch_free
+func librsync_patch_free(handle C.intptr_t) {
+	dropHandle(handle)
+}

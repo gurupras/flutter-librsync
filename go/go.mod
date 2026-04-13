@@ -10,4 +10,4 @@ require (
 	golang.org/x/sys v0.6.0 // indirect
 )
 
-replace github.com/balena-os/librsync-go => github.com/gurupras/librsync-go v0.9.0-gurupras-2
+replace github.com/balena-os/librsync-go => github.com/gurupras/librsync-go v0.9.0-gurupras-4
