@@ -4,276 +4,432 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
-import '../interfaces.dart';
+// ─── C type for the patch read_at callback ────────────────────────────────────
 
-// ─── C type aliases ───────────────────────────────────────────────────────────
+/// Native type: int32_t (*read_at)(void* userdata, int64_t offset,
+///                                  uint8_t* buf, size_t len, size_t* bytes_read)
+typedef ReadAtFn = ffi.Int32 Function(
+  ffi.Pointer<ffi.Void>,
+  ffi.Int64,
+  ffi.Pointer<ffi.Uint8>,
+  ffi.Size,
+  ffi.Pointer<ffi.Size>,
+);
 
-/// int64_t (*read)(void* ctx, uint8_t* buf, int64_t len)
-typedef RsReadFn = ffi.Int64 Function(
-    ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Uint8>, ffi.Int64);
+// ─── C struct ─────────────────────────────────────────────────────────────────
 
-/// int64_t (*seek)(void* ctx, int64_t offset, int32_t whence)
-typedef RsSeekFn = ffi.Int64 Function(
-    ffi.Pointer<ffi.Void>, ffi.Int64, ffi.Int32);
-
-/// int64_t (*write)(void* ctx, const uint8_t* buf, int64_t len)
-typedef RsWriteFn = ffi.Int64 Function(
-    ffi.Pointer<ffi.Void>, ffi.Pointer<ffi.Uint8>, ffi.Int64);
-
-// ─── C struct definitions ─────────────────────────────────────────────────────
-
-/// Mirrors `rs_reader_t` in librsync.go (sequential reader, no seek).
-final class RsReader extends ffi.Struct {
-  external ffi.Pointer<ffi.NativeFunction<RsReadFn>> read;
-  external ffi.Pointer<ffi.Void> ctx;
+/// Mirrors rs_read_seeker_t in the C ABI.
+final class RsReadSeekerT extends ffi.Struct {
+  external ffi.Pointer<ffi.Void> userdata;
+  external ffi.Pointer<ffi.NativeFunction<ReadAtFn>> read_at;
 }
 
-/// Mirrors `rs_read_seeker_t` in librsync.go (seekable reader).
-final class RsReadSeeker extends ffi.Struct {
-  external ffi.Pointer<ffi.NativeFunction<RsReadFn>> read;
-  external ffi.Pointer<ffi.NativeFunction<RsSeekFn>> seek;
-  external ffi.Pointer<ffi.Void> ctx;
-}
+// ─── Native function signatures ───────────────────────────────────────────────
 
-/// Mirrors `rs_writer_t` in librsync.go.
-final class RsWriter extends ffi.Struct {
-  external ffi.Pointer<ffi.NativeFunction<RsWriteFn>> write;
-  external ffi.Pointer<ffi.Void> ctx;
-}
+typedef _NativeFree = ffi.Void Function(ffi.Pointer<ffi.Void>);
+typedef _NativeStrerror = ffi.Pointer<ffi.Char> Function(ffi.Int32);
 
-// ─── Native function types ────────────────────────────────────────────────────
+// Batch API
+typedef _NativeBatchSig = ffi.Int32 Function(
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Uint32, ffi.Uint32, ffi.Uint32,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativeBatchDelta = ffi.Int32 Function(
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativeBatchPatch = ffi.Int32 Function(
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
 
-typedef _NativeSignature = ffi.Pointer<ffi.Char> Function(
-    ffi.Pointer<RsReader>,
-    ffi.Pointer<RsWriter>,
-    ffi.Uint32,
-    ffi.Uint32,
-    ffi.Uint32);
+// Parsed signature handle
+typedef _NativeSigParse = ffi.IntPtr Function(ffi.Pointer<ffi.Uint8>, ffi.Size);
+typedef _NativeSigFree = ffi.Void Function(ffi.IntPtr);
 
-typedef _NativeDelta = ffi.Pointer<ffi.Char> Function(
-    ffi.Pointer<RsReader>, ffi.Pointer<RsReader>, ffi.Pointer<RsWriter>);
+// Streaming signature
+typedef _NativeSigNew = ffi.IntPtr Function(ffi.Uint32, ffi.Uint32, ffi.Uint32);
+typedef _NativeSigFeed = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativeSigEnd = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativeSigStreamFree = ffi.Void Function(ffi.IntPtr);
 
-typedef _NativePatch = ffi.Pointer<ffi.Char> Function(
-    ffi.Pointer<RsReadSeeker>, ffi.Pointer<RsReader>, ffi.Pointer<RsWriter>);
+// Streaming delta
+typedef _NativeDeltaNew = ffi.IntPtr Function(ffi.IntPtr);
+typedef _NativeDeltaFeed = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativeDeltaEnd = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativeDeltaFree = ffi.Void Function(ffi.IntPtr);
 
-typedef _NativeFreeString = ffi.Void Function(ffi.Pointer<ffi.Char>);
+// Streaming patch
+typedef _NativePatchNew = ffi.IntPtr Function(ffi.Pointer<RsReadSeekerT>);
+// patch_feed only buffers — no output params.
+typedef _NativePatchFeed = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+);
+typedef _NativePatchEnd = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+);
+typedef _NativePatchFree = ffi.Void Function(ffi.IntPtr);
 
 // ─── Library loader ───────────────────────────────────────────────────────────
 
 ffi.DynamicLibrary _openLib() {
   const name = 'flutter_librsync';
-  if (Platform.isIOS) {
-    // iOS: statically linked into the process image.
-    return ffi.DynamicLibrary.process();
-  }
-  if (Platform.isMacOS) {
-    return ffi.DynamicLibrary.open('lib$name.dylib');
-  }
+  if (Platform.isIOS) return ffi.DynamicLibrary.process();
+  if (Platform.isMacOS) return ffi.DynamicLibrary.open('lib$name.dylib');
   if (Platform.isAndroid || Platform.isLinux) {
     return ffi.DynamicLibrary.open('lib$name.so');
   }
-  if (Platform.isWindows) {
-    return ffi.DynamicLibrary.open('$name.dll');
-  }
-  throw UnsupportedError('flutter_librsync: unsupported platform ${Platform.operatingSystem}');
+  if (Platform.isWindows) return ffi.DynamicLibrary.open('$name.dll');
+  throw UnsupportedError(
+      'flutter_librsync: unsupported platform ${Platform.operatingSystem}');
 }
 
 final _lib = _openLib();
 
-// ─── Bound native functions ───────────────────────────────────────────────────
+// ─── Bound functions ──────────────────────────────────────────────────────────
 
-final _signature = _lib
-    .lookup<ffi.NativeFunction<_NativeSignature>>('librsync_signature')
+final _free = _lib
+    .lookup<ffi.NativeFunction<_NativeFree>>('librsync_free')
+    .asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
+final _strerror = _lib
+    .lookup<ffi.NativeFunction<_NativeStrerror>>('librsync_strerror')
+    .asFunction<ffi.Pointer<ffi.Char> Function(int)>();
+
+// Batch
+final _batchSignature = _lib
+    .lookup<ffi.NativeFunction<_NativeBatchSig>>('librsync_signature')
     .asFunction<
-        ffi.Pointer<ffi.Char> Function(ffi.Pointer<RsReader>,
-            ffi.Pointer<RsWriter>, int, int, int)>();
+        int Function(
+          ffi.Pointer<ffi.Uint8>, int,
+          int, int, int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
 
-final _delta = _lib
-    .lookup<ffi.NativeFunction<_NativeDelta>>('librsync_delta')
+final _batchDelta = _lib
+    .lookup<ffi.NativeFunction<_NativeBatchDelta>>('librsync_delta')
     .asFunction<
-        ffi.Pointer<ffi.Char> Function(ffi.Pointer<RsReader>,
-            ffi.Pointer<RsReader>, ffi.Pointer<RsWriter>)>();
+        int Function(
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
 
-final _patch = _lib
-    .lookup<ffi.NativeFunction<_NativePatch>>('librsync_patch')
+final _batchPatch = _lib
+    .lookup<ffi.NativeFunction<_NativeBatchPatch>>('librsync_patch')
     .asFunction<
-        ffi.Pointer<ffi.Char> Function(ffi.Pointer<RsReadSeeker>,
-            ffi.Pointer<RsReader>, ffi.Pointer<RsWriter>)>();
+        int Function(
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
 
-final _freeString = _lib
-    .lookup<ffi.NativeFunction<_NativeFreeString>>('librsync_free_string')
-    .asFunction<void Function(ffi.Pointer<ffi.Char>)>();
+// Parsed sig handle
+final _sigParse = _lib
+    .lookup<ffi.NativeFunction<_NativeSigParse>>('librsync_sig_parse')
+    .asFunction<int Function(ffi.Pointer<ffi.Uint8>, int)>();
 
-// ─── Public binding helpers ───────────────────────────────────────────────────
+final _sigFree = _lib
+    .lookup<ffi.NativeFunction<_NativeSigFree>>('librsync_sig_free')
+    .asFunction<void Function(int)>();
 
-String? _checkError(ffi.Pointer<ffi.Char> errPtr) {
-  if (errPtr == ffi.nullptr) return null;
-  final msg = errPtr.cast<Utf8>().toDartString();
-  _freeString(errPtr);
-  return msg;
+// Streaming signature
+final _signatureNew = _lib
+    .lookup<ffi.NativeFunction<_NativeSigNew>>('librsync_signature_new')
+    .asFunction<int Function(int, int, int)>();
+
+final _signatureFeed = _lib
+    .lookup<ffi.NativeFunction<_NativeSigFeed>>('librsync_signature_feed')
+    .asFunction<
+        int Function(
+          int,
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
+
+final _signatureEnd = _lib
+    .lookup<ffi.NativeFunction<_NativeSigEnd>>('librsync_signature_end')
+    .asFunction<
+        int Function(
+          int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
+
+final _signatureStreamFree = _lib
+    .lookup<ffi.NativeFunction<_NativeSigStreamFree>>('librsync_signature_free')
+    .asFunction<void Function(int)>();
+
+// Streaming delta
+final _deltaNew = _lib
+    .lookup<ffi.NativeFunction<_NativeDeltaNew>>('librsync_delta_new')
+    .asFunction<int Function(int)>();
+
+final _deltaFeed = _lib
+    .lookup<ffi.NativeFunction<_NativeDeltaFeed>>('librsync_delta_feed')
+    .asFunction<
+        int Function(
+          int,
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
+
+final _deltaEnd = _lib
+    .lookup<ffi.NativeFunction<_NativeDeltaEnd>>('librsync_delta_end')
+    .asFunction<
+        int Function(
+          int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
+
+final _deltaFree = _lib
+    .lookup<ffi.NativeFunction<_NativeDeltaFree>>('librsync_delta_free')
+    .asFunction<void Function(int)>();
+
+// Streaming patch
+final _patchNew = _lib
+    .lookup<ffi.NativeFunction<_NativePatchNew>>('librsync_patch_new')
+    .asFunction<int Function(ffi.Pointer<RsReadSeekerT>)>();
+
+final _patchFeed = _lib
+    .lookup<ffi.NativeFunction<_NativePatchFeed>>('librsync_patch_feed')
+    .asFunction<int Function(int, ffi.Pointer<ffi.Uint8>, int)>();
+
+final _patchEnd = _lib
+    .lookup<ffi.NativeFunction<_NativePatchEnd>>('librsync_patch_end')
+    .asFunction<
+        int Function(
+          int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
+
+final _patchFree = _lib
+    .lookup<ffi.NativeFunction<_NativePatchFree>>('librsync_patch_free')
+    .asFunction<void Function(int)>();
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Throws [LibrsyncException] if [code] is non-zero.
+void checkReturn(int code) {
+  if (code == 0) return;
+  final msgPtr = _strerror(code);
+  final msg = msgPtr == ffi.nullptr
+      ? 'error code $code'
+      : msgPtr.cast<Utf8>().toDartString();
+  throw LibrsyncException(msg);
 }
 
-/// Calls `librsync_signature` with Dart [ReadSeeker] / [Writer] objects.
-///
-/// Must be called on the isolate that owns [input] and [output].
-void nativeSignature(
-  ReadSeeker input,
-  Writer output, {
+/// Copies native output buffer to a Dart [Uint8List] and frees the native
+/// buffer. Returns an empty list if [outLenPtr] is zero.
+Uint8List collectOutput(
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>> outPtrPtr,
+  ffi.Pointer<ffi.Size> outLenPtr,
+) {
+  final len = outLenPtr.value;
+  if (len == 0) return Uint8List(0);
+  final ptr = outPtrPtr.value;
+  final result = Uint8List.fromList(ptr.asTypedList(len));
+  _free(ptr.cast<ffi.Void>());
+  return result;
+}
+
+/// Copies [bytes] into a calloc-allocated native buffer.
+/// The caller is responsible for freeing the returned pointer.
+ffi.Pointer<ffi.Uint8> copyToNative(Uint8List bytes) {
+  final ptr = calloc<ffi.Uint8>(bytes.length == 0 ? 1 : bytes.length);
+  if (bytes.isNotEmpty) ptr.asTypedList(bytes.length).setAll(0, bytes);
+  return ptr;
+}
+
+// ─── Public batch helpers ─────────────────────────────────────────────────────
+
+/// Runs [librsync_signature] (batch). Copies [input] to native, returns output.
+Uint8List nativeBatchSignature(
+  Uint8List input, {
   required int blockLen,
   required int strongLen,
   required int sigType,
 }) {
-  // Build NativeCallables from Dart closures. These are valid only while the
-  // C call is in progress (Go is single-threaded within our CGO boundary).
-  final readCallable = ffi.NativeCallable<RsReadFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      return input.readInto(buf.asTypedList(len));
-    },
-    exceptionalReturn: -1,
-  );
-
-  final writeCallable = ffi.NativeCallable<RsWriteFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      output.write(Uint8List.fromList(buf.asTypedList(len)));
-      return len;
-    },
-    exceptionalReturn: -1,
-  );
-
-  final reader = calloc<RsReader>();
-  final writer = calloc<RsWriter>();
-
+  final inPtr = copyToNative(input);
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
   try {
-    reader.ref.read = readCallable.nativeFunction;
-    reader.ref.ctx = ffi.nullptr;
-    writer.ref.write = writeCallable.nativeFunction;
-    writer.ref.ctx = ffi.nullptr;
-
-    final errPtr = _signature(reader, writer, blockLen, strongLen, sigType);
-    final err = _checkError(errPtr);
-    if (err != null) throw LibrsyncException(err);
+    checkReturn(
+      _batchSignature(inPtr, input.length, blockLen, strongLen, sigType,
+          outPtrPtr, outLenPtr),
+    );
+    return collectOutput(outPtrPtr, outLenPtr);
   } finally {
-    calloc.free(reader);
-    calloc.free(writer);
-    readCallable.close();
-    writeCallable.close();
+    calloc.free(inPtr);
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
   }
 }
 
-/// Calls `librsync_delta` with Dart [ReadSeeker] / [Writer] objects.
-void nativeDelta(
-  ReadSeeker sigInput,
-  ReadSeeker newData,
-  Writer output,
+/// Runs [librsync_delta] (batch).
+Uint8List nativeBatchDelta(Uint8List sig, Uint8List newData) {
+  final sigPtr = copyToNative(sig);
+  final dataPtr = copyToNative(newData);
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
+  try {
+    checkReturn(
+      _batchDelta(sigPtr, sig.length, dataPtr, newData.length,
+          outPtrPtr, outLenPtr),
+    );
+    return collectOutput(outPtrPtr, outLenPtr);
+  } finally {
+    calloc.free(sigPtr);
+    calloc.free(dataPtr);
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
+  }
+}
+
+/// Runs [librsync_patch] (batch).
+Uint8List nativeBatchPatch(Uint8List base, Uint8List delta) {
+  final basePtr = copyToNative(base);
+  final deltaPtr = copyToNative(delta);
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
+  try {
+    checkReturn(
+      _batchPatch(basePtr, base.length, deltaPtr, delta.length,
+          outPtrPtr, outLenPtr),
+    );
+    return collectOutput(outPtrPtr, outLenPtr);
+  } finally {
+    calloc.free(basePtr);
+    calloc.free(deltaPtr);
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
+  }
+}
+
+// ─── Re-exports for streaming.dart ───────────────────────────────────────────
+
+// Streaming signature
+int signatureNewHandle(int blockLen, int strongLen, int sigType) =>
+    _signatureNew(blockLen, strongLen, sigType);
+
+Uint8List signatureFeedHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> inputPtr,
+  int inputLen,
 ) {
-  final sigReadCallable = ffi.NativeCallable<RsReadFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      return sigInput.readInto(buf.asTypedList(len));
-    },
-    exceptionalReturn: -1,
-  );
-
-  final dataReadCallable = ffi.NativeCallable<RsReadFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      return newData.readInto(buf.asTypedList(len));
-    },
-    exceptionalReturn: -1,
-  );
-
-  final writeCallable = ffi.NativeCallable<RsWriteFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      output.write(Uint8List.fromList(buf.asTypedList(len)));
-      return len;
-    },
-    exceptionalReturn: -1,
-  );
-
-  final sigReader = calloc<RsReader>();
-  final dataReader = calloc<RsReader>();
-  final writer = calloc<RsWriter>();
-
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
   try {
-    sigReader.ref.read = sigReadCallable.nativeFunction;
-    sigReader.ref.ctx = ffi.nullptr;
-    dataReader.ref.read = dataReadCallable.nativeFunction;
-    dataReader.ref.ctx = ffi.nullptr;
-    writer.ref.write = writeCallable.nativeFunction;
-    writer.ref.ctx = ffi.nullptr;
-
-    final errPtr = _delta(sigReader, dataReader, writer);
-    final err = _checkError(errPtr);
-    if (err != null) throw LibrsyncException(err);
+    checkReturn(_signatureFeed(handle, inputPtr, inputLen, outPtrPtr, outLenPtr));
+    return collectOutput(outPtrPtr, outLenPtr);
   } finally {
-    calloc.free(sigReader);
-    calloc.free(dataReader);
-    calloc.free(writer);
-    sigReadCallable.close();
-    dataReadCallable.close();
-    writeCallable.close();
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
   }
 }
 
-/// Calls `librsync_patch` with Dart [ReadSeeker] / [Writer] objects.
-void nativePatch(
-  ReadSeeker base,
-  ReadSeeker delta,
-  Writer output,
+Uint8List signatureEndHandle(int handle) {
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
+  try {
+    checkReturn(_signatureEnd(handle, outPtrPtr, outLenPtr));
+    return collectOutput(outPtrPtr, outLenPtr);
+  } finally {
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
+  }
+}
+
+void signatureFreeHandle(int handle) => _signatureStreamFree(handle);
+
+// Streaming delta
+int sigParseHandle(ffi.Pointer<ffi.Uint8> ptr, int len) =>
+    _sigParse(ptr, len);
+
+void sigFreeHandle(int handle) => _sigFree(handle);
+
+int deltaNewHandle(int sigHandle) => _deltaNew(sigHandle);
+
+Uint8List deltaFeedHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> inputPtr,
+  int inputLen,
 ) {
-  final baseReadCallable = ffi.NativeCallable<RsReadFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      return base.readInto(buf.asTypedList(len));
-    },
-    exceptionalReturn: -1,
-  );
-
-  final baseSeekCallable = ffi.NativeCallable<RsSeekFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, int offset, int whence) {
-      return base.seek(offset, whence);
-    },
-    exceptionalReturn: -1,
-  );
-
-  final deltaReadCallable = ffi.NativeCallable<RsReadFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      return delta.readInto(buf.asTypedList(len));
-    },
-    exceptionalReturn: -1,
-  );
-
-  final writeCallable = ffi.NativeCallable<RsWriteFn>.isolateLocal(
-    (ffi.Pointer<ffi.Void> _, ffi.Pointer<ffi.Uint8> buf, int len) {
-      output.write(Uint8List.fromList(buf.asTypedList(len)));
-      return len;
-    },
-    exceptionalReturn: -1,
-  );
-
-  final baseRS = calloc<RsReadSeeker>();
-  final deltaReader = calloc<RsReader>();
-  final writer = calloc<RsWriter>();
-
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
   try {
-    baseRS.ref.read = baseReadCallable.nativeFunction;
-    baseRS.ref.seek = baseSeekCallable.nativeFunction;
-    baseRS.ref.ctx = ffi.nullptr;
-    deltaReader.ref.read = deltaReadCallable.nativeFunction;
-    deltaReader.ref.ctx = ffi.nullptr;
-    writer.ref.write = writeCallable.nativeFunction;
-    writer.ref.ctx = ffi.nullptr;
-
-    final errPtr = _patch(baseRS, deltaReader, writer);
-    final err = _checkError(errPtr);
-    if (err != null) throw LibrsyncException(err);
+    checkReturn(_deltaFeed(handle, inputPtr, inputLen, outPtrPtr, outLenPtr));
+    return collectOutput(outPtrPtr, outLenPtr);
   } finally {
-    calloc.free(baseRS);
-    calloc.free(deltaReader);
-    calloc.free(writer);
-    baseReadCallable.close();
-    baseSeekCallable.close();
-    deltaReadCallable.close();
-    writeCallable.close();
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
   }
 }
+
+Uint8List deltaEndHandle(int handle) {
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
+  try {
+    checkReturn(_deltaEnd(handle, outPtrPtr, outLenPtr));
+    return collectOutput(outPtrPtr, outLenPtr);
+  } finally {
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
+  }
+}
+
+void deltaFreeHandle(int handle) => _deltaFree(handle);
+
+// Streaming patch
+int patchNewHandle(ffi.Pointer<RsReadSeekerT> base) => _patchNew(base);
+
+/// Buffers [deltaLen] bytes — no output. All output comes from [patchEndHandle].
+void patchFeedHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> deltaPtr,
+  int deltaLen,
+) =>
+    checkReturn(_patchFeed(handle, deltaPtr, deltaLen));
+
+Uint8List patchEndHandle(int handle) {
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
+  try {
+    checkReturn(_patchEnd(handle, outPtrPtr, outLenPtr));
+    return collectOutput(outPtrPtr, outLenPtr);
+  } finally {
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
+  }
+}
+
+void patchFreeHandle(int handle) => _patchFree(handle);
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// BLAKE2 signature magic number (preferred).
+const int librsyncBlake2 = 0x72730137;
+
+/// MD4 signature magic number (deprecated legacy).
+const int librsyncMd4 = 0x72730136;
 
 // ─── Exception ────────────────────────────────────────────────────────────────
 
