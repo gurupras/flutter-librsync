@@ -12,6 +12,8 @@
 
 #ifndef GO_CGO_GOSTRING_TYPEDEF
 typedef struct { const char *p; ptrdiff_t n; } _GoString_;
+extern size_t _GoStringLen(_GoString_ s);
+extern const char *_GoStringPtr(_GoString_ s);
 #endif
 
 #endif
@@ -24,43 +26,16 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 #include <stdint.h>
 #include <stdlib.h>
 
-typedef int64_t (*rs_read_fn_t)(void* ctx, uint8_t* buf, int64_t len);
-typedef int64_t (*rs_seek_fn_t)(void* ctx, int64_t offset, int32_t whence);
-typedef int64_t (*rs_write_fn_t)(void* ctx, const uint8_t* buf, int64_t len);
-
-// Sequential reader (no seek; used for signature input, new-data input, delta input)
+// Callback struct for random-access reads on the base file.
+// Dart allocates this with calloc and keeps it alive for the patch session.
 typedef struct {
-    rs_read_fn_t read;
-    void*        ctx;
-} rs_reader_t;
-
-// Seekable reader (used for patch base)
-typedef struct {
-    rs_read_fn_t read;
-    rs_seek_fn_t seek;
-    void*        ctx;
+    void* userdata;
+    int32_t (*read_at)(void* userdata, int64_t offset, uint8_t* buf, size_t len, size_t* bytes_read);
 } rs_read_seeker_t;
 
-// Writer (used for all outputs)
-typedef struct {
-    rs_write_fn_t write;
-    void*         ctx;
-} rs_writer_t;
-
-// Inline helpers to call through function pointers.
-// CGO does not allow calling C function pointers directly from Go,
-// so we use static inline trampolines.
-static inline int64_t _rs_read(rs_reader_t* r, uint8_t* buf, int64_t len) {
-    return r->read(r->ctx, buf, len);
-}
-static inline int64_t _rs_rs_read(rs_read_seeker_t* r, uint8_t* buf, int64_t len) {
-    return r->read(r->ctx, buf, len);
-}
-static inline int64_t _rs_seek(rs_read_seeker_t* r, int64_t offset, int32_t whence) {
-    return r->seek(r->ctx, offset, whence);
-}
-static inline int64_t _rs_write(rs_writer_t* w, const uint8_t* buf, int64_t len) {
-    return w->write(w->ctx, buf, len);
+// Trampoline so Go can call the function pointer without unsafe casts.
+static int32_t call_read_at(const rs_read_seeker_t* rs, int64_t offset, uint8_t* buf, size_t len, size_t* bytes_read) {
+    return rs->read_at(rs->userdata, offset, buf, len, bytes_read);
 }
 
 #line 1 "cgo-generated-wrapper"
@@ -89,9 +64,15 @@ typedef size_t GoUintptr;
 typedef float GoFloat32;
 typedef double GoFloat64;
 #ifdef _MSC_VER
+#if !defined(__cplusplus) || _MSVC_LANG <= 201402L
 #include <complex.h>
 typedef _Fcomplex GoComplex64;
 typedef _Dcomplex GoComplex128;
+#else
+#include <complex>
+typedef std::complex<float> GoComplex64;
+typedef std::complex<double> GoComplex128;
+#endif
 #else
 typedef float _Complex GoComplex64;
 typedef double _Complex GoComplex128;
@@ -119,51 +100,25 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
-
-// librsync_signature generates an rsync signature.
-//
-// input    – sequential reader for the basis file
-// output   – writer for the signature data
-// blockLen – block length for checksumming (e.g. 2048)
-// strongLen – strong hash length in bytes (e.g. 32 for BLAKE2)
-// sigType  – magic number: BLAKE2_SIG_MAGIC (0x72730137) or MD4_SIG_MAGIC (0x72730136)
-//
-// Returns NULL on success, or a heap-allocated C string describing the error.
-// The caller must free the returned string with librsync_free_string.
-//
-extern char* librsync_signature(rs_reader_t* input, rs_writer_t* output, uint32_t blockLen, uint32_t strongLen, uint32_t sigType);
-
-// librsync_delta generates a delta between a signature and new file data.
-//
-// sigInput – sequential reader for the signature produced by librsync_signature
-// newData  – sequential reader for the new (modified) file
-// output   – writer for the delta data
-//
-// Returns NULL on success, or a heap-allocated error string (free with librsync_free_string).
-//
-extern char* librsync_delta(rs_reader_t* sigInput, rs_reader_t* newData, rs_writer_t* output);
-
-// librsync_patch reconstructs a new file by applying a delta to a base file.
-//
-// base   – seekable reader for the basis file (must support random access)
-// delta  – sequential reader for the delta produced by librsync_delta
-// output – writer for the reconstructed file
-//
-// Returns NULL on success, or a heap-allocated error string (free with librsync_free_string).
-//
-extern char* librsync_patch(rs_read_seeker_t* base, rs_reader_t* delta, rs_writer_t* output);
-
-// librsync_free_string frees a C string returned by any librsync_* function.
-//
-extern void librsync_free_string(char* s);
-
-// librsync_blake2_sig_magic returns the BLAKE2 signature magic number.
-//
-extern uint32_t librsync_blake2_sig_magic();
-
-// librsync_md4_sig_magic returns the MD4 signature magic number (deprecated).
-//
-extern uint32_t librsync_md4_sig_magic();
+extern char* librsync_strerror(int32_t code);
+extern void librsync_free(void* ptr);
+extern int32_t librsync_signature(uint8_t* inputPtr, size_t inputLen, uint32_t blockLen, uint32_t strongLen, uint32_t sigType, uint8_t** outPtr, size_t* outLen);
+extern int32_t librsync_delta(uint8_t* sigPtr, size_t sigLen, uint8_t* inputPtr, size_t inputLen, uint8_t** outPtr, size_t* outLen);
+extern int32_t librsync_patch(uint8_t* basePtr, size_t baseLen, uint8_t* deltaPtr, size_t deltaLen, uint8_t** outPtr, size_t* outLen);
+extern intptr_t librsync_sig_parse(uint8_t* sigPtr, size_t sigLen);
+extern void librsync_sig_free(intptr_t handle);
+extern intptr_t librsync_signature_new(uint32_t blockLen, uint32_t strongLen, uint32_t sigType);
+extern int32_t librsync_signature_feed(intptr_t handle, uint8_t* inputPtr, size_t inputLen, uint8_t** outPtr, size_t* outLen);
+extern int32_t librsync_signature_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
+extern void librsync_signature_free(intptr_t handle);
+extern intptr_t librsync_delta_new(intptr_t sigHandle);
+extern int32_t librsync_delta_feed(intptr_t handle, uint8_t* inputPtr, size_t inputLen, uint8_t** outPtr, size_t* outLen);
+extern int32_t librsync_delta_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
+extern void librsync_delta_free(intptr_t handle);
+extern intptr_t librsync_patch_new(rs_read_seeker_t* rs);
+extern int32_t librsync_patch_feed(intptr_t handle, uint8_t* deltaPtr, size_t deltaLen);
+extern int32_t librsync_patch_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
+extern void librsync_patch_free(intptr_t handle);
 
 #ifdef __cplusplus
 }
