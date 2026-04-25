@@ -16,6 +16,7 @@ committed to your project.
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Streaming sync (sender / receiver)](#streaming-sync-sender--receiver)
   - [Bytes API (simplest)](#bytes-api-simplest)
   - [File API](#file-api)
   - [Sync API (custom streams)](#sync-api-custom-streams)
@@ -101,6 +102,214 @@ Import the package:
 import 'package:flutter_librsync/flutter_librsync.dart';
 ```
 
+---
+
+### Streaming sync (sender / receiver)
+
+This is the primary API for syncing files between two devices. Delta chunks are
+produced and consumed incrementally — neither the new file nor the base file is
+ever fully loaded into memory. Suitable for files of any size.
+
+**All streaming methods are synchronous and must be called from a background
+isolate** — wrap your entire send or receive loop in `Isolate.run` or use an
+existing worker isolate.
+
+#### Overview
+
+```
+RECEIVER                                  SENDER
+────────                                  ──────
+1. generate signature of basis file
+2. send signature ──────────────────────► receive signature
+                                          3. generate delta chunks from new file
+                    ◄────────────────────  4. stream delta chunks
+5. receive delta chunks
+6. apply delta to basis → new file
+7. atomically replace basis with new file
+```
+
+---
+
+#### Step 1 — Receiver: generate and send signature
+
+The receiver generates a compact signature (~1% of file size) of their current
+version of the file and sends it to the sender.
+
+```dart
+import 'dart:isolate';
+import 'package:flutter_librsync/flutter_librsync.dart';
+
+Future<Uint8List> generateSignature(String basePath) {
+  return Isolate.run(() {
+    final builder = BytesBuilder(copy: false);
+    final stream = SignatureStream();
+    final file = File(basePath).openSync();
+    final buf = Uint8List(defaultChunkSize);
+    try {
+      while (true) {
+        final n = file.readIntoSync(buf);
+        if (n == 0) break;
+        final out = stream.feed(buf.sublist(0, n));
+        if (out.isNotEmpty) builder.add(out);
+      }
+      builder.add(stream.end());
+    } catch (_) {
+      stream.close();
+      rethrow;
+    } finally {
+      file.closeSync();
+    }
+    return builder.takeBytes();
+  });
+}
+```
+
+Send `sigBytes` to the sender via your network transport.
+
+**Zero-copy variant** — if your isolate manages its own C-heap buffer pool, use
+`feedPtr` to skip the internal copy:
+
+```dart
+import 'dart:ffi' as ffi;
+import 'package:ffi/ffi.dart';
+
+// allocate a reusable pool buffer once
+final buf = calloc<ffi.Uint8>(defaultChunkSize);
+try {
+  while (true) {
+    final n = file.readIntoSync(buf.asTypedList(defaultChunkSize));
+    if (n == 0) break;
+    final out = stream.feedPtr(buf, n);  // no copy into Go
+    if (out.isNotEmpty) builder.add(out);
+  }
+} finally {
+  calloc.free(buf);
+}
+```
+
+---
+
+#### Step 2 — Sender: stream delta chunks
+
+The sender receives the signature, opens the new file sequentially, and streams
+delta chunks to the receiver as they are produced.
+
+```dart
+import 'dart:isolate';
+import 'package:flutter_librsync/flutter_librsync.dart';
+
+// sendChunk is your network transport callback — called for each delta chunk.
+Future<void> streamDelta(
+  Uint8List sigBytes,
+  String newFilePath,
+  void Function(Uint8List chunk) sendChunk,
+) {
+  return Isolate.run(() {
+    final sig = SigHandle.fromBytes(sigBytes);
+    final stream = DeltaStream(sig);
+    final file = File(newFilePath).openSync();
+    final buf = Uint8List(defaultChunkSize);
+    try {
+      while (true) {
+        final n = file.readIntoSync(buf);
+        if (n == 0) break;
+        final out = stream.feed(buf.sublist(0, n));
+        if (out.isNotEmpty) sendChunk(out);
+      }
+      final tail = stream.end();
+      if (tail.isNotEmpty) sendChunk(tail);
+    } catch (_) {
+      stream.close();
+      rethrow;
+    } finally {
+      file.closeSync();
+      sig.close();
+    }
+  });
+}
+```
+
+The new file is read sequentially in `defaultChunkSize` (256 KB) chunks. Delta
+output may be empty for many chunks — the library buffers literals internally
+until a flush threshold is reached. All remaining output is flushed on `end()`.
+
+**Zero-copy variant** — use `feedPtr` with a pool buffer (same pattern as
+signature above, substituting `DeltaStream`).
+
+> **Content URIs (Android) / security-scoped URLs (iOS):** Only the sender
+> needs to read the new file, and it only needs sequential access. Open the
+> content URI via your platform's file-picker or share-intent APIs to obtain a
+> `Stream<List<int>>` or `RandomAccessFile`, read it chunk by chunk, and feed
+> each chunk to `DeltaStream.feed`. No path is required — sequential read is
+> sufficient.
+
+---
+
+#### Step 3 — Receiver: apply delta to basis file
+
+The receiver applies incoming delta chunks to their local basis file to
+reconstruct the new file. The basis file is accessed via `pread` — it is never
+loaded into memory. Output chunks are written to a temporary file and atomically
+renamed when complete.
+
+```dart
+import 'dart:io';
+import 'dart:isolate';
+import 'package:flutter_librsync/flutter_librsync.dart';
+
+// Call this in a background isolate.
+// deltaChunks is an Iterable/Stream of Uint8List received from the sender.
+void applyDelta(
+  String basePath,
+  Iterable<Uint8List> deltaChunks,
+  String destinationPath,
+) {
+  final tmpPath = '$destinationPath.tmp';
+  final tmpFile = File(tmpPath).openSync(mode: FileMode.write);
+  final stream = PatchStream.fromPath(basePath);
+  try {
+    for (final chunk in deltaChunks) {
+      final out = stream.feed(chunk);
+      if (out.isNotEmpty) tmpFile.writeFromSync(out);
+    }
+    final tail = stream.end();
+    if (tail.isNotEmpty) tmpFile.writeFromSync(tail);
+    tmpFile.closeSync();
+    // Atomic replace — only visible to readers once complete.
+    File(tmpPath).renameSync(destinationPath);
+  } catch (_) {
+    stream.close();
+    tmpFile.closeSync();
+    try { File(tmpPath).deleteSync(); } catch (_) {}
+    rethrow;
+  }
+}
+```
+
+`PatchStream.fromPath` opens the basis file in Go and uses `pread` (POSIX) or
+overlapped I/O (Windows) for random access. The basis file is never loaded into
+memory regardless of size.
+
+The temporary file plus atomic rename ensures the destination is never left in
+a partially-written state if the process is interrupted.
+
+---
+
+#### Complete end-to-end example
+
+```
+Device A (sender)                         Device B (receiver)
+─────────────────                         ────────────────────
+                    ◄── sigBytes ──────── generateSignature(basePath)
+streamDelta(sigBytes, newFilePath,
+  sendChunk: network.send)
+  ──── delta chunks ────────────────────► applyDelta(basePath,
+                                            incomingChunks,
+                                            destinationPath)
+```
+
+---
+
 ### Bytes API (simplest)
 
 All operations run on a background isolate so the UI thread is never blocked.
@@ -131,6 +340,8 @@ Optional parameters on `signatureBytes` (and the other signature methods):
 | `strongLen`| `32`             | Strong checksum length in bytes          |
 | `sigType`  | `blake2SigMagic` | `blake2SigMagic` (default) or `md4SigMagic` |
 
+---
+
 ### File API
 
 Operates directly on files — does not load the whole file into memory.
@@ -139,7 +350,6 @@ Operates directly on files — does not load the whole file into memory.
 import 'package:flutter_librsync/flutter_librsync.dart';
 
 Future<void> fileExample() async {
-  // Paths to files on disk
   const basisPath    = '/data/user/0/com.example/files/basis.bin';
   const newFilePath  = '/data/user/0/com.example/files/new.bin';
   const sigPath      = '/tmp/basis.sig';
@@ -161,6 +371,8 @@ final sigBytes = await Librsync.signatureFileToBytes(basisPath);
 // Delta from files, returned as bytes
 final deltaBytes = await Librsync.deltaFileToBytes(sigPath, newFilePath);
 ```
+
+---
 
 ### Sync API (custom streams)
 
@@ -420,12 +632,37 @@ final result = ps.finish();
 | `beginDelta(sig)` | web only | Chunked streaming delta |
 | `beginPatch(base)` | web only | Chunked streaming patch |
 
+### Streaming classes (native only)
+
+| Class | Description |
+|-------|-------------|
+| `SignatureStream` | Streaming signature session. Feed chunks via `feed()`/`feedPtr()`, finalise with `end()`. |
+| `DeltaStream` | Streaming delta session. Requires a `SigHandle`. Feed new-file chunks via `feed()`/`feedPtr()`, finalise with `end()`. |
+| `PatchStream.fromPath(path)` | Patch session backed by a file on disk. Go holds the file open and uses `pread` — no memory pressure regardless of file size. |
+| `PatchStream.fromBytes(base)` | Patch session backed by an in-memory buffer. Suitable for small base data. |
+| `PatchStream.fromFile(raf)` | Patch session backed by an open `RandomAccessFile`. Reads the file into memory at construction. |
+| `SigHandle` | Parsed signature ready for use by one or more `DeltaStream` sessions. |
+
+#### `feedPtr` (zero-copy)
+
+Both `SignatureStream` and `DeltaStream` expose a `feedPtr` method for callers
+that manage their own C-heap buffer pool:
+
+```dart
+Uint8List feedPtr(ffi.Pointer<ffi.Uint8> ptr, int length)
+```
+
+The pointer must remain valid and unmodified until the call returns. The caller
+retains ownership — the library never frees it. Use `dart:ffi` and
+`package:ffi` to allocate and manage the pool.
+
 ### Constants
 
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `blake2SigMagic` | `0x72730137` | BLAKE2 signature type (default) |
 | `md4SigMagic` | `0x72730136` | MD4 signature type (legacy) |
+| `defaultChunkSize` | `262144` | Default read buffer size (256 KB) |
 
 ### `SeekOrigin`
 
