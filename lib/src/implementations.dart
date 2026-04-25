@@ -41,6 +41,9 @@ class FileReadSeeker implements ReadSeeker {
       default:
         throw ArgumentError.value(whence, 'whence', 'Invalid seek origin');
     }
+    if (newPos < 0) {
+      throw RangeError.range(newPos, 0, null, 'offset', 'seek past beginning of file');
+    }
     _file.setPositionSync(newPos);
     return newPos;
   }
@@ -61,6 +64,12 @@ class BytesReadSeeker implements ReadSeeker {
   /// the data before sending it across an [Isolate.run] boundary.
   final Uint8List bytes;
   int _position = 0;
+
+  /// The unread portion of [bytes] from the current position to the end.
+  ///
+  /// Returns [bytes] directly (no copy) when position is 0.
+  Uint8List get remainingBytes =>
+      _position == 0 ? bytes : bytes.sublist(_position);
 
   BytesReadSeeker(this.bytes);
 
@@ -86,6 +95,9 @@ class BytesReadSeeker implements ReadSeeker {
         newPos = bytes.length + offset;
       default:
         throw ArgumentError.value(whence, 'whence', 'Invalid seek origin');
+    }
+    if (newPos < 0) {
+      throw RangeError.range(newPos, 0, null, 'offset', 'seek past beginning of file');
     }
     _position = newPos.clamp(0, bytes.length);
     return _position;

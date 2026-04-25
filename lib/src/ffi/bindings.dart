@@ -21,6 +21,7 @@ typedef ReadAtFn = ffi.Int32 Function(
 /// Mirrors rs_read_seeker_t in the C ABI.
 final class RsReadSeekerT extends ffi.Struct {
   external ffi.Pointer<ffi.Void> userdata;
+  // ignore: non_constant_identifier_names — mirrors snake_case C ABI field name.
   external ffi.Pointer<ffi.NativeFunction<ReadAtFn>> read_at;
 }
 
@@ -78,10 +79,13 @@ typedef _NativeDeltaFree = ffi.Void Function(ffi.IntPtr);
 
 // Streaming patch
 typedef _NativePatchNew = ffi.IntPtr Function(ffi.Pointer<RsReadSeekerT>);
-// patch_feed only buffers — no output params.
+typedef _NativePatchNewBuf = ffi.IntPtr Function(
+    ffi.Pointer<ffi.Uint8>, ffi.Size);
+typedef _NativePatchNewPath = ffi.IntPtr Function(ffi.Pointer<ffi.Char>);
 typedef _NativePatchFeed = ffi.Int32 Function(
   ffi.IntPtr,
   ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
 );
 typedef _NativePatchEnd = ffi.Int32 Function(
   ffi.IntPtr,
@@ -209,9 +213,22 @@ final _patchNew = _lib
     .lookup<ffi.NativeFunction<_NativePatchNew>>('librsync_patch_new')
     .asFunction<int Function(ffi.Pointer<RsReadSeekerT>)>();
 
+final _patchNewBuf = _lib
+    .lookup<ffi.NativeFunction<_NativePatchNewBuf>>('librsync_patch_new_buf')
+    .asFunction<int Function(ffi.Pointer<ffi.Uint8>, int)>();
+
+final _patchNewPath = _lib
+    .lookup<ffi.NativeFunction<_NativePatchNewPath>>('librsync_patch_new_path')
+    .asFunction<int Function(ffi.Pointer<ffi.Char>)>();
+
 final _patchFeed = _lib
     .lookup<ffi.NativeFunction<_NativePatchFeed>>('librsync_patch_feed')
-    .asFunction<int Function(int, ffi.Pointer<ffi.Uint8>, int)>();
+    .asFunction<
+        int Function(
+          int,
+          ffi.Pointer<ffi.Uint8>, int,
+          ffi.Pointer<ffi.Pointer<ffi.Uint8>>, ffi.Pointer<ffi.Size>,
+        )>();
 
 final _patchEnd = _lib
     .lookup<ffi.NativeFunction<_NativePatchEnd>>('librsync_patch_end')
@@ -231,9 +248,13 @@ final _patchFree = _lib
 void checkReturn(int code) {
   if (code == 0) return;
   final msgPtr = _strerror(code);
-  final msg = msgPtr == ffi.nullptr
-      ? 'error code $code'
-      : msgPtr.cast<Utf8>().toDartString();
+  final String msg;
+  if (msgPtr == ffi.nullptr) {
+    msg = 'error code $code';
+  } else {
+    msg = msgPtr.cast<Utf8>().toDartString();
+    _free(msgPtr.cast<ffi.Void>());
+  }
   throw LibrsyncException(msg);
 }
 
@@ -252,16 +273,19 @@ Uint8List collectOutput(
 }
 
 /// Copies [bytes] into a calloc-allocated native buffer.
-/// The caller is responsible for freeing the returned pointer.
+///
+/// Ownership of the returned pointer belongs to the caller.  Most callers
+/// free it in a `finally` block; [patchNewBufHandle] transfers ownership to Go
+/// on success and must NOT free it afterward.
 ffi.Pointer<ffi.Uint8> copyToNative(Uint8List bytes) {
-  final ptr = calloc<ffi.Uint8>(bytes.length == 0 ? 1 : bytes.length);
+  final ptr = calloc<ffi.Uint8>(bytes.isEmpty ? 1 : bytes.length);
   if (bytes.isNotEmpty) ptr.asTypedList(bytes.length).setAll(0, bytes);
   return ptr;
 }
 
 // ─── Public batch helpers ─────────────────────────────────────────────────────
 
-/// Runs [librsync_signature] (batch). Copies [input] to native, returns output.
+/// Runs [librsync_signature] (batch).
 Uint8List nativeBatchSignature(
   Uint8List input, {
   required int blockLen,
@@ -284,7 +308,6 @@ Uint8List nativeBatchSignature(
   }
 }
 
-/// Runs [librsync_delta] (batch).
 Uint8List nativeBatchDelta(Uint8List sig, Uint8List newData) {
   final sigPtr = copyToNative(sig);
   final dataPtr = copyToNative(newData);
@@ -304,7 +327,6 @@ Uint8List nativeBatchDelta(Uint8List sig, Uint8List newData) {
   }
 }
 
-/// Runs [librsync_patch] (batch).
 Uint8List nativeBatchPatch(Uint8List base, Uint8List delta) {
   final basePtr = copyToNative(base);
   final deltaPtr = copyToNative(delta);
@@ -330,6 +352,8 @@ Uint8List nativeBatchPatch(Uint8List base, Uint8List delta) {
 int signatureNewHandle(int blockLen, int strongLen, int sigType) =>
     _signatureNew(blockLen, strongLen, sigType);
 
+// Note: signatureFeed/signatureEnd never write to outPtr on error (Go returns
+// early before calling setOutput on failure), so no defensive catch is needed.
 Uint8List signatureFeedHandle(
   int handle,
   ffi.Pointer<ffi.Uint8> inputPtr,
@@ -368,6 +392,8 @@ void sigFreeHandle(int handle) => _sigFree(handle);
 
 int deltaNewHandle(int sigHandle) => _deltaNew(sigHandle);
 
+// Note: deltaFeed/deltaEnd never write to outPtr on error (same invariant as
+// signature functions above), so no defensive catch is needed.
 Uint8List deltaFeedHandle(
   int handle,
   ffi.Pointer<ffi.Uint8> inputPtr,
@@ -401,13 +427,46 @@ void deltaFreeHandle(int handle) => _deltaFree(handle);
 // Streaming patch
 int patchNewHandle(ffi.Pointer<RsReadSeekerT> base) => _patchNew(base);
 
-/// Buffers [deltaLen] bytes — no output. All output comes from [patchEndHandle].
-void patchFeedHandle(
+/// Creates a patch session backed by a C-heap copy of [dataPtr].
+/// Go takes ownership of [dataPtr] on success (handle > 0) and will free it.
+/// On failure (handle == 0) the caller must free [dataPtr].
+int patchNewBufHandle(ffi.Pointer<ffi.Uint8> dataPtr, int dataLen) =>
+    _patchNewBuf(dataPtr, dataLen);
+
+/// Creates a patch session backed by [path] opened by Go.
+/// Go opens the file, holds it for the session lifetime, and closes it on free/end.
+/// Returns handle > 0 on success, 0 if the file cannot be opened.
+int patchNewPathHandle(String path) {
+  final pathPtr = path.toNativeUtf8();
+  try {
+    return _patchNewPath(pathPtr.cast());
+  } finally {
+    calloc.free(pathPtr);
+  }
+}
+
+Uint8List patchFeedHandle(
   int handle,
   ffi.Pointer<ffi.Uint8> deltaPtr,
   int deltaLen,
-) =>
-    checkReturn(_patchFeed(handle, deltaPtr, deltaLen));
+) {
+  final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
+  final outLenPtr = calloc<ffi.Size>();
+  try {
+    checkReturn(_patchFeed(handle, deltaPtr, deltaLen, outPtrPtr, outLenPtr));
+    return collectOutput(outPtrPtr, outLenPtr);
+  } catch (_) {
+    // Go does not currently write to outPtr on error (setOutput is only called
+    // on the success path), but this catch is retained defensively in case the
+    // Go implementation changes.
+    final outPtr = outPtrPtr.value;
+    if (outPtr != ffi.nullptr) _free(outPtr.cast<ffi.Void>());
+    rethrow;
+  } finally {
+    calloc.free(outPtrPtr);
+    calloc.free(outLenPtr);
+  }
+}
 
 Uint8List patchEndHandle(int handle) {
   final outPtrPtr = calloc<ffi.Pointer<ffi.Uint8>>();
@@ -415,6 +474,11 @@ Uint8List patchEndHandle(int handle) {
   try {
     checkReturn(_patchEnd(handle, outPtrPtr, outLenPtr));
     return collectOutput(outPtrPtr, outLenPtr);
+  } catch (_) {
+    // Same rationale as patchFeedHandle.
+    final outPtr = outPtrPtr.value;
+    if (outPtr != ffi.nullptr) _free(outPtr.cast<ffi.Void>());
+    rethrow;
   } finally {
     calloc.free(outPtrPtr);
     calloc.free(outLenPtr);

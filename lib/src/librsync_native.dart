@@ -3,6 +3,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'ffi/bindings.dart' as native_ffi;
+import 'implementations.dart';
 import 'interfaces.dart';
 import 'streaming.dart';
 
@@ -165,15 +166,13 @@ abstract final class Librsync {
   /// **Do not call from the UI isolate.**
   static DeltaStream beginDelta(SigHandle sig) => DeltaStream(sig);
 
-  /// Returns a [PatchStream] session.
+  /// Returns a [PatchStream] session backed by an in-memory [base].
   ///
-  /// [readAt] receives `(offset, buffer)` and must fill [buffer] from the base
-  /// file at [offset].  Feed delta chunks via [PatchStream.feed]; call
-  /// [PatchStream.end] to apply the delta and receive all reconstructed bytes.
+  /// The base data is copied to C-heap at construction so the Go patch
+  /// goroutine can access it from any OS thread.
   /// **Do not call from the UI isolate.**
-  static PatchStream beginPatch(
-          int Function(int offset, Uint8List buffer) readAt) =>
-      PatchStream(readAt);
+  static PatchStream beginPatch(Uint8List base) =>
+      PatchStream.fromBytes(base);
 
   // ── Legacy sync (ReadSeeker / Writer) ─────────────────────────────────────
 
@@ -212,7 +211,13 @@ abstract final class Librsync {
     // Read signature fully — it's compact (~1% of file size).
     final sigBytes = _drainReadSeeker(sigInput);
     final sig = SigHandle.fromBytes(sigBytes);
-    final stream = DeltaStream(sig);
+    final DeltaStream stream;
+    try {
+      stream = DeltaStream(sig);
+    } catch (_) {
+      sig.close();
+      rethrow;
+    }
     final buf = Uint8List(defaultChunkSize);
     try {
       while (true) {
@@ -232,30 +237,15 @@ abstract final class Librsync {
   }
 
   /// Applies a delta synchronously.  **Do not call from the UI isolate.**
-  ///
-  /// [base] must support [ReadSeeker.seek] since patch requires random access.
   static void patchSync(
     ReadSeeker base,
     ReadSeeker deltaInput,
     Writer output,
   ) {
-    final stream = PatchStream((offset, buffer) {
-      base.seek(offset, SeekOrigin.start);
-      return base.readInto(buffer);
-    });
-    final buf = Uint8List(defaultChunkSize);
-    try {
-      while (true) {
-        final n = deltaInput.readInto(buf);
-        if (n == 0) break;
-        stream.feed(buf.sublist(0, n));
-      }
-      final result = stream.end();
-      if (result.isNotEmpty) output.write(result);
-    } catch (_) {
-      stream.close();
-      rethrow;
-    }
+    final baseBytes = _drainReadSeeker(base);
+    final deltaBytes = _drainReadSeeker(deltaInput);
+    final result = native_ffi.nativeBatchPatch(baseBytes, deltaBytes);
+    if (result.isNotEmpty) output.write(result);
   }
 }
 
@@ -291,22 +281,24 @@ void _runSignatureStream(
 }) {
   final stream =
       SignatureStream(blockLen: blockLen, strongLen: strongLen, sigType: sigType);
-  final input = File(inputPath).openSync();
-  final buf = Uint8List(defaultChunkSize);
   try {
-    while (true) {
-      final n = input.readIntoSync(buf);
-      if (n == 0) break;
-      final out = stream.feed(buf.sublist(0, n));
-      if (out.isNotEmpty) onChunk(out);
+    final input = File(inputPath).openSync();
+    final buf = Uint8List(defaultChunkSize);
+    try {
+      while (true) {
+        final n = input.readIntoSync(buf);
+        if (n == 0) break;
+        final out = stream.feed(buf.sublist(0, n));
+        if (out.isNotEmpty) onChunk(out);
+      }
+      final tail = stream.end();
+      if (tail.isNotEmpty) onChunk(tail);
+    } finally {
+      input.closeSync();
     }
-    final tail = stream.end();
-    if (tail.isNotEmpty) onChunk(tail);
   } catch (_) {
     stream.close();
     rethrow;
-  } finally {
-    input.closeSync();
   }
 }
 
@@ -331,23 +323,28 @@ void _runDeltaStream(
   // Signature is compact — read it all at once.
   final sigBytes = File(sigPath).readAsBytesSync();
   final sig = SigHandle.fromBytes(sigBytes);
-  final stream = DeltaStream(sig);
-  final input = File(newFilePath).openSync();
-  final buf = Uint8List(defaultChunkSize);
   try {
-    while (true) {
-      final n = input.readIntoSync(buf);
-      if (n == 0) break;
-      final out = stream.feed(buf.sublist(0, n));
-      if (out.isNotEmpty) onChunk(out);
+    final stream = DeltaStream(sig);
+    try {
+      final input = File(newFilePath).openSync();
+      final buf = Uint8List(defaultChunkSize);
+      try {
+        while (true) {
+          final n = input.readIntoSync(buf);
+          if (n == 0) break;
+          final out = stream.feed(buf.sublist(0, n));
+          if (out.isNotEmpty) onChunk(out);
+        }
+        final tail = stream.end();
+        if (tail.isNotEmpty) onChunk(tail);
+      } finally {
+        input.closeSync();
+      }
+    } catch (_) {
+      stream.close();
+      rethrow;
     }
-    final tail = stream.end();
-    if (tail.isNotEmpty) onChunk(tail);
-  } catch (_) {
-    stream.close();
-    rethrow;
   } finally {
-    input.closeSync();
     sig.close();
   }
 }
@@ -357,33 +354,39 @@ void _patchFileSync(
   String deltaPath,
   String outputPath,
 ) {
-  final baseFile = File(basePath).openSync();
-  final out = File(outputPath).openSync(mode: FileMode.write);
-  final stream = PatchStream.fromFile(baseFile);
-  final input = File(deltaPath).openSync();
-  final buf = Uint8List(defaultChunkSize);
+  final baseBytes = File(basePath).readAsBytesSync();
+  final stream = PatchStream.fromBytes(baseBytes);
   try {
-    while (true) {
-      final n = input.readIntoSync(buf);
-      if (n == 0) break;
-      stream.feed(buf.sublist(0, n));
+    final deltaFile = File(deltaPath).openSync();
+    try {
+      final out = File(outputPath).openSync(mode: FileMode.write);
+      final buf = Uint8List(defaultChunkSize);
+      try {
+        while (true) {
+          final n = deltaFile.readIntoSync(buf);
+          if (n == 0) break;
+          final chunk = stream.feed(buf.sublist(0, n));
+          if (chunk.isNotEmpty) out.writeFromSync(chunk);
+        }
+        final tail = stream.end();
+        if (tail.isNotEmpty) out.writeFromSync(tail);
+      } finally {
+        out.closeSync();
+      }
+    } finally {
+      deltaFile.closeSync();
     }
-    final result = stream.end();
-    if (result.isNotEmpty) out.writeFromSync(result);
   } catch (_) {
     stream.close();
     rethrow;
-  } finally {
-    input.closeSync();
-    baseFile.closeSync();
-    out.closeSync();
   }
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
 Uint8List _drainReadSeeker(ReadSeeker rs) {
-  final builder = BytesBuilder();
+  if (rs is BytesReadSeeker) return rs.remainingBytes;
+  final builder = BytesBuilder(copy: false);
   final buf = Uint8List(defaultChunkSize);
   while (true) {
     final n = rs.readInto(buf);

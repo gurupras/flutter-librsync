@@ -87,7 +87,7 @@ final class SigHandle {
 /// }
 /// ```
 final class SignatureStream {
-  int _handle;
+  final int _handle;
   bool _ended = false;
 
   SignatureStream({
@@ -117,10 +117,18 @@ final class SignatureStream {
     }
   }
 
+  /// Zero-copy variant of [feed] for callers managing their own C-heap buffers.
+  ///
+  /// [ptr] must remain valid and unmodified until this call returns.
+  /// The caller retains ownership of [ptr] — this method never frees it.
+  Uint8List feedPtr(ffi.Pointer<ffi.Uint8> ptr, int length) =>
+      b.signatureFeedHandle(_handle, ptr, length);
+
   /// Finalises the session and returns any remaining output.
   ///
   /// Invalidates the handle — do not call [close] after [end].
   Uint8List end() {
+    // Set _ended before the native call so close() is a no-op if end() throws.
     _ended = true;
     return b.signatureEndHandle(_handle);
   }
@@ -161,7 +169,7 @@ final class SignatureStream {
 /// }
 /// ```
 final class DeltaStream {
-  int _handle;
+  final int _handle;
   bool _ended = false;
 
   DeltaStream(SigHandle sig)
@@ -184,10 +192,18 @@ final class DeltaStream {
     }
   }
 
+  /// Zero-copy variant of [feed] for callers managing their own C-heap buffers.
+  ///
+  /// [ptr] must remain valid and unmodified until this call returns.
+  /// The caller retains ownership of [ptr] — this method never frees it.
+  Uint8List feedPtr(ffi.Pointer<ffi.Uint8> ptr, int length) =>
+      b.deltaFeedHandle(_handle, ptr, length);
+
   /// Finalises the session and flushes all remaining output.
   ///
   /// Invalidates the handle — do not call [close] after [end].
   Uint8List end() {
+    // Set _ended before the native call so close() is a no-op if end() throws.
     _ended = true;
     return b.deltaEndHandle(_handle);
   }
@@ -206,45 +222,97 @@ final class DeltaStream {
 
 /// A streaming patch session.
 ///
-/// The patch algorithm requires random access to the base file.  Provide a
-/// [readAt] callback that reads bytes from an arbitrary offset.  For file-backed
-/// base data, use [PatchStream.fromFile].
+/// The patch algorithm requires random access to the base file.  Use
+/// [PatchStream.fromFile] or [PatchStream.fromBytes] — both copy base data to
+/// C-heap memory at construction time so the Go patch goroutine can access it
+/// from any OS thread without Dart callbacks.
 ///
-/// Feed all delta chunks via [feed] (buffered internally), then call [end] to
-/// apply the delta and receive all reconstructed bytes at once.
-///
-/// **Lifetime requirement:** the [readAt] callback (and its backing resources)
-/// must remain alive from construction until [end] or [close] returns.
+/// Feed delta chunks via [feed]; call [end] to apply the delta and receive all
+/// reconstructed bytes.
 ///
 /// ```dart
-/// final stream = PatchStream.fromFile(raf);
+/// final stream = PatchStream.fromFile(file);
 /// try {
 ///   for (final chunk in deltaChunks) {
-///     stream.feed(chunk); // buffers; no output yet
+///     final partial = stream.feed(chunk);
+///     if (partial.isNotEmpty) sink.add(partial);
 ///   }
-///   final result = stream.end(); // applies delta, returns reconstructed file
-///   sink.add(result);
+///   final tail = stream.end();
+///   if (tail.isNotEmpty) sink.add(tail);
 /// } catch (_) {
 ///   stream.close();
 ///   rethrow;
 /// }
 /// ```
 final class PatchStream {
-  int _handle;
+  final int _handle;
   bool _ended = false;
 
-  // Owned resources — kept alive for the session lifetime.
-  final ffi.NativeCallable<b.ReadAtFn> _callable;
+  // Non-null only for the deprecated raw-callback constructor path.
+  // Both are null/nullptr for the safe fromBytes/fromFile path.
+  final ffi.NativeCallable<b.ReadAtFn>? _callable;
   final ffi.Pointer<b.RsReadSeekerT> _seekerPtr;
 
   PatchStream._(this._handle, this._callable, this._seekerPtr);
 
-  /// Creates a [PatchStream] backed by [readAt].
+  /// Creates a [PatchStream] backed by the file at [path].
   ///
-  /// [readAt] receives `(offset, buffer)` and must fill [buffer] starting at
-  /// [offset] in the base file.  It returns the number of bytes read; returning
-  /// fewer bytes than `buffer.length` is only permitted at EOF.
-  factory PatchStream(int Function(int offset, Uint8List buffer) readAt) {
+  /// Go opens the file and reads it on demand using thread-safe random access
+  /// (pread on POSIX, overlapped I/O on Windows).  The file is never fully
+  /// loaded into memory — suitable for arbitrarily large base files.
+  /// Go closes the file when the session ends or is freed.
+  ///
+  /// Throws [LibrsyncException] if the file cannot be opened.
+  factory PatchStream.fromPath(String path) {
+    final handle = b.patchNewPathHandle(path);
+    if (handle == 0) {
+      throw b.LibrsyncException('failed to open base file: $path');
+    }
+    return PatchStream._(handle, null, ffi.nullptr);
+  }
+
+  /// Creates a [PatchStream] backed by an in-memory [base].
+  ///
+  /// The base data is copied to C-heap memory at construction so the Go patch
+  /// goroutine can read it safely from any OS thread.
+  factory PatchStream.fromBytes(Uint8List base) {
+    final dataPtr = b.copyToNative(base);
+    // Go takes ownership of dataPtr on success — do NOT free on success path.
+    final handle = b.patchNewBufHandle(dataPtr, base.length);
+    if (handle == 0) {
+      calloc.free(dataPtr);
+      throw const b.LibrsyncException('failed to create patch session');
+    }
+    return PatchStream._(handle, null, ffi.nullptr);
+  }
+
+  /// Creates a [PatchStream] backed by [file].
+  ///
+  /// The file is read from the beginning into C-heap memory at construction so
+  /// the Go patch goroutine can read it safely from any OS thread.  [file] may
+  /// be closed after this constructor returns.  **Do not call from the UI isolate.**
+  factory PatchStream.fromFile(RandomAccessFile file) {
+    file.setPositionSync(0);
+    final bytes = file.readSync(file.lengthSync());
+    return PatchStream.fromBytes(bytes);
+  }
+
+  /// Creates a [PatchStream] backed by a caller-supplied [readAt] callback.
+  ///
+  /// **Deprecated.** `NativeCallable.isolateLocal` is unsafe when the Go patch
+  /// goroutine invokes the callback from a background OS thread.  Use
+  /// [PatchStream.fromBytes] or [PatchStream.fromFile] instead — they use a
+  /// C-heap readAt that is thread-safe.
+  ///
+  /// [readAt] receives `(offset, buffer)` and must fill [buffer] from the base
+  /// file starting at [offset].  Returns bytes read; fewer than
+  /// `buffer.length` is only permitted at EOF.
+  @Deprecated(
+    'NativeCallable.isolateLocal is called from a Go background OS thread, '
+    'which is unsafe. Use PatchStream.fromBytes or PatchStream.fromFile instead.',
+  )
+  factory PatchStream.withCallback(
+      int Function(int offset, Uint8List buffer) readAt) {
     final seekerPtr = calloc<b.RsReadSeekerT>();
 
     final callable = ffi.NativeCallable<b.ReadAtFn>.isolateLocal(
@@ -254,10 +322,10 @@ final class PatchStream {
           final view = buf.asTypedList(len);
           final n = readAt(offset, view);
           bytesRead.value = n;
-          return 0; // LIBRSYNC_OK
+          return 0;
         } catch (_) {
           bytesRead.value = 0;
-          return -1; // LIBRSYNC_ERR_ARGS
+          return -1;
         }
       },
       exceptionalReturn: -1,
@@ -275,34 +343,14 @@ final class PatchStream {
     return PatchStream._(handle, callable, seekerPtr);
   }
 
-  /// Creates a [PatchStream] that reads the base file from [file].
+  /// Sends a [delta] chunk to the patch goroutine.
   ///
-  /// [file] must remain open for the session lifetime.
-  factory PatchStream.fromFile(RandomAccessFile file) {
-    return PatchStream((offset, buffer) {
-      file.setPositionSync(offset);
-      return file.readIntoSync(buffer);
-    });
-  }
-
-  /// Creates a [PatchStream] from an in-memory base.
-  ///
-  /// Use for small files only.  For large files, prefer [PatchStream.fromFile].
-  factory PatchStream.fromBytes(Uint8List base) {
-    return PatchStream((offset, buffer) {
-      final available = base.length - offset;
-      if (available <= 0) return 0;
-      final n = buffer.length < available ? buffer.length : available;
-      buffer.setRange(0, n, base, offset);
-      return n;
-    });
-  }
-
-  /// Buffers a [delta] chunk. All reconstructed output is returned by [end].
-  void feed(Uint8List delta) {
+  /// Returns any reconstructed bytes produced so far.  May be empty — all
+  /// output is guaranteed to be flushed by [end].
+  Uint8List feed(Uint8List delta) {
     final ptr = b.copyToNative(delta);
     try {
-      b.patchFeedHandle(_handle, ptr, delta.length);
+      return b.patchFeedHandle(_handle, ptr, delta.length);
     } finally {
       calloc.free(ptr);
     }
@@ -312,11 +360,13 @@ final class PatchStream {
   ///
   /// Invalidates the handle — do not call [close] after [end].
   Uint8List end() {
+    // Set _ended before the native call: Go's librsync_patch_end drops the
+    // handle unconditionally (even on error), so close() must not free it again.
     _ended = true;
     try {
       return b.patchEndHandle(_handle);
     } finally {
-      _teardownCallable();
+      _teardown();
     }
   }
 
@@ -327,11 +377,11 @@ final class PatchStream {
     if (_ended) return;
     _ended = true;
     b.patchFreeHandle(_handle);
-    _teardownCallable();
+    _teardown();
   }
 
-  void _teardownCallable() {
-    _callable.close();
-    calloc.free(_seekerPtr);
+  void _teardown() {
+    _callable?.close();
+    if (_seekerPtr != ffi.nullptr) calloc.free(_seekerPtr);
   }
 }

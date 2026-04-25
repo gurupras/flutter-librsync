@@ -2,8 +2,8 @@ github.com/balena-os/circbuf v0.1.3 h1:pLkTha46mQ2FOfB4l9sz4fckt8oorpVSWIp6N3xW+
 github.com/balena-os/circbuf v0.1.3/go.mod h1:D8R+zPJf/Sfd43NP++rdNfGAf7KefcKG1b6k2Ww0ZzU=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/gurupras/librsync-go v0.9.0-gurupras-4 h1:S4y3PQmefXtEferPX47bruxK/DCW7VZITYplDiIm35k=
-github.com/gurupras/librsync-go v0.9.0-gurupras-4/go.mod h1:66OAWSdBh+x2Vh1KXFZiQJ7womKOO+qOYO3fYyALgxA=
+github.com/gurupras/librsync-go v0.9.0-gurupras-5 h1:smenFw1Tlarge/TVfBDHq13JOiRr8uaxzI0YEIbaV2U=
+github.com/gurupras/librsync-go v0.9.0-gurupras-5/go.mod h1:66OAWSdBh+x2Vh1KXFZiQJ7womKOO+qOYO3fYyALgxA=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.8.1 h1:w7B6lhMri9wdJUVmEZPGGhZzrYTPvgJArz7wNPgYKsk=

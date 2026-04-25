@@ -21,6 +21,7 @@ import "C"
 import (
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"unsafe"
 
@@ -39,14 +40,15 @@ const (
 	errMem     = C.int32_t(-3)
 )
 
-// librsync_strerror returns a static string for the given error code.
-// The returned pointer is valid forever; never call librsync_free on it.
+// librsync_strerror returns a newly-allocated C string describing code.
+// The caller must free the returned pointer with librsync_free.
+// Returns NULL for errOK — only call on non-zero codes.
 //
 //export librsync_strerror
 func librsync_strerror(code C.int32_t) *C.char {
 	switch code {
 	case errOK:
-		return C.CString("ok")
+		return nil
 	case errArgs:
 		return C.CString("invalid arguments")
 	case errCorrupt:
@@ -340,8 +342,31 @@ func librsync_delta_free(handle C.intptr_t) {
 
 // ── Streaming Patch ───────────────────────────────────────────────────────────
 
+// patchSession wraps a PatchSession plus optional resources owned by Go.
+// For librsync_patch_new (NativeCallable path): all optional fields are zero.
+// For librsync_patch_new_buf (safe path): cData is non-nil and freed on teardown.
+// For librsync_patch_new_path (file path): file is non-nil and closed on teardown.
+type patchSession struct {
+	sess  *adapter.PatchSession
+	cData unsafe.Pointer // non-nil only for buf path — freed on teardown
+	cLen  int64
+	file  *os.File // non-nil only for path path — closed on teardown
+}
+
+func (ps *patchSession) cleanup() {
+	if ps.cData != nil {
+		C.free(ps.cData)
+		ps.cData = nil
+	}
+	if ps.file != nil {
+		ps.file.Close()
+		ps.file = nil
+	}
+}
+
 // newCallbackReadAt wraps rs_read_seeker_t as an adapter.ReadAtFunc.
 // Inlined from ffi/internal/cbridge to avoid the internal package restriction.
+// Used only by librsync_patch_new (the NativeCallable / Dart-closure path).
 func newCallbackReadAt(rs *C.rs_read_seeker_t) adapter.ReadAtFunc {
 	return func(offset int64, buf []byte) (int, error) {
 		if len(buf) == 0 {
@@ -366,34 +391,98 @@ func newCallbackReadAt(rs *C.rs_read_seeker_t) adapter.ReadAtFunc {
 	}
 }
 
-// librsync_patch_new creates a streaming patch session. The rs_read_seeker_t
-// struct and its NativeCallable must remain valid until librsync_patch_end or
-// librsync_patch_free returns. Returns a handle > 0 on success, 0 on failure.
+// newBufReadAt returns a ReadAtFunc that reads from a C-heap buffer.
+// The closure captures only a plain pointer and an int — no Dart objects,
+// no GC interaction — so it is safe to call from any OS thread.
+func newBufReadAt(data unsafe.Pointer, dataLen int64) adapter.ReadAtFunc {
+	return func(offset int64, buf []byte) (int, error) {
+		if offset >= dataLen {
+			return 0, io.EOF
+		}
+		available := dataLen - offset
+		n := int64(len(buf))
+		if n > available {
+			n = available
+		}
+		src := unsafe.Slice((*byte)(data), dataLen)
+		copy(buf[:n], src[offset:])
+		return int(n), nil
+	}
+}
+
+// librsync_patch_new creates a streaming patch session using a Dart-provided
+// NativeCallable as the base-file readAt.  The rs_read_seeker_t struct and its
+// NativeCallable must remain valid until librsync_patch_end or
+// librsync_patch_free returns.  Returns a handle > 0 on success, 0 on failure.
+//
+// NOTE: NativeCallable.isolateLocal is only safe when called from the Dart
+// isolate thread.  Use librsync_patch_new_buf for thread-safe operation.
 //
 //export librsync_patch_new
 func librsync_patch_new(rs *C.rs_read_seeker_t) C.intptr_t {
 	if rs == nil || rs.read_at == nil {
 		return 0
 	}
-	readAt := newCallbackReadAt(rs)
-	sess := adapter.NewPatchSession(readAt)
-	return storeHandle(sess)
+	sess := adapter.NewPatchSession(newCallbackReadAt(rs))
+	return storeHandle(&patchSession{sess: sess})
 }
 
-// librsync_patch_feed buffers a chunk of the delta stream.
+// librsync_patch_new_buf creates a streaming patch session backed by a
+// C-heap buffer.  The readAt closure reads directly from C memory — no Dart
+// callback is invoked — so it is safe to call from any OS thread.
+//
+// Ownership transfer: Go takes ownership of dataPtr on success (return > 0)
+// and will free it when the session is freed.  On failure (return 0) the
+// caller must free dataPtr.
+//
+//export librsync_patch_new_buf
+func librsync_patch_new_buf(dataPtr *C.uint8_t, dataLen C.size_t) C.intptr_t {
+	cData := unsafe.Pointer(dataPtr)
+	cLen := int64(dataLen)
+	sess := adapter.NewPatchSession(newBufReadAt(cData, cLen))
+	return storeHandle(&patchSession{sess: sess, cData: cData, cLen: cLen})
+}
+
+// librsync_patch_new_path creates a streaming patch session backed by a file
+// opened from [path].  Go opens the file, holds it for the session lifetime,
+// and closes it when the session is freed or ended.  os.File.ReadAt uses
+// pread(2) on POSIX and overlapped I/O on Windows — both are thread-safe and
+// position-independent, so no Dart callbacks are involved.
+// Returns a handle > 0 on success, 0 on failure (file not found, no permission, etc.)
+//
+//export librsync_patch_new_path
+func librsync_patch_new_path(path *C.char) C.intptr_t {
+	f, err := os.Open(C.GoString(path))
+	if err != nil {
+		return 0
+	}
+	readAt := func(offset int64, buf []byte) (int, error) {
+		return f.ReadAt(buf, offset)
+	}
+	sess := adapter.NewPatchSession(readAt)
+	return storeHandle(&patchSession{sess: sess, file: f})
+}
+
+// librsync_patch_feed sends a chunk of the delta stream to the patch goroutine
+// and returns whatever output has been produced so far. *out_ptr/*out_len may
+// be NULL/0 if no output is ready yet. Caller must librsync_free(*out_ptr) if
+// *out_len > 0. On error the handle is valid only for librsync_patch_free.
 //
 //export librsync_patch_feed
 func librsync_patch_feed(
 	handle C.intptr_t,
 	deltaPtr *C.uint8_t, deltaLen C.size_t,
+	outPtr **C.uint8_t, outLen *C.size_t,
 ) C.int32_t {
-	sess, ok := loadHandle(handle).(*adapter.PatchSession)
+	ps, ok := loadHandle(handle).(*patchSession)
 	if !ok {
 		return errArgs
 	}
-	if err := sess.Feed(cInput(deltaPtr, deltaLen)); err != nil {
+	result, err := ps.sess.Feed(cInput(deltaPtr, deltaLen))
+	if err != nil {
 		return errCorrupt
 	}
+	setOutput(outPtr, outLen, result)
 	return errOK
 }
 
@@ -406,12 +495,13 @@ func librsync_patch_end(
 	handle C.intptr_t,
 	outPtr **C.uint8_t, outLen *C.size_t,
 ) C.int32_t {
-	sess, ok := loadHandle(handle).(*adapter.PatchSession)
+	ps, ok := loadHandle(handle).(*patchSession)
 	dropHandle(handle)
 	if !ok {
 		return errArgs
 	}
-	result, err := sess.End()
+	defer ps.cleanup()
+	result, err := ps.sess.End()
 	if err != nil {
 		return errCorrupt
 	}
@@ -420,8 +510,14 @@ func librsync_patch_end(
 }
 
 // librsync_patch_free abandons the session without applying the patch.
+// Blocks briefly to drain the patch goroutine cleanly.
 //
 //export librsync_patch_free
 func librsync_patch_free(handle C.intptr_t) {
+	ps, ok := loadHandle(handle).(*patchSession)
+	if ok {
+		ps.sess.Close()
+		ps.cleanup()
+	}
 	dropHandle(handle)
 }
