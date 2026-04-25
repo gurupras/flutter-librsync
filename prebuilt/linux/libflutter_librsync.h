@@ -116,7 +116,9 @@ extern int32_t librsync_delta_feed(intptr_t handle, uint8_t* inputPtr, size_t in
 extern int32_t librsync_delta_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
 extern void librsync_delta_free(intptr_t handle);
 extern intptr_t librsync_patch_new(rs_read_seeker_t* rs);
-extern int32_t librsync_patch_feed(intptr_t handle, uint8_t* deltaPtr, size_t deltaLen);
+extern intptr_t librsync_patch_new_buf(uint8_t* dataPtr, size_t dataLen);
+extern intptr_t librsync_patch_new_path(char* path);
+extern int32_t librsync_patch_feed(intptr_t handle, uint8_t* deltaPtr, size_t deltaLen, uint8_t** outPtr, size_t* outLen);
 extern int32_t librsync_patch_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
 extern void librsync_patch_free(intptr_t handle);
 
