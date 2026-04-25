@@ -412,13 +412,7 @@ void main() {
         final sig   = await Librsync.signatureBytes(basis);
         final delta = await Librsync.deltaBytes(sig, mod);
         await _bench('PatchStream  ${e.key}', e.value, () async {
-          final s = Librsync.beginPatch((offset, buf) {
-            final avail = basis.length - offset;
-            if (avail <= 0) return 0;
-            final n = buf.length < avail ? buf.length : avail;
-            buf.setRange(0, n, basis, offset);
-            return n;
-          });
+          final s = Librsync.beginPatch(basis);
           try {
             _feedAllPatch(s, delta);
           } catch (_) {
