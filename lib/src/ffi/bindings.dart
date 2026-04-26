@@ -93,6 +93,26 @@ typedef _NativePatchEnd = ffi.Int32 Function(
 );
 typedef _NativePatchFree = ffi.Void Function(ffi.IntPtr);
 
+// ─── Zero-copy *_into variants ────────────────────────────────────────────────
+//
+// All three sessions share the same shape:
+//   feed_into(handle, in*, inLen, dst*, dstLen, *bytesWritten) → status
+//   end_into (handle,                dst*, dstLen, *bytesWritten) → status
+
+typedef _NativeFeedInto = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Size>,
+  ffi.Pointer<ffi.Int32>,
+);
+typedef _NativeEndInto = ffi.Int32 Function(
+  ffi.IntPtr,
+  ffi.Pointer<ffi.Uint8>, ffi.Size,
+  ffi.Pointer<ffi.Size>,
+  ffi.Pointer<ffi.Int32>,
+);
+
 // ─── Library loader ───────────────────────────────────────────────────────────
 
 ffi.DynamicLibrary _openLib() {
@@ -241,6 +261,44 @@ final _patchEnd = _lib
 final _patchFree = _lib
     .lookup<ffi.NativeFunction<_NativePatchFree>>('librsync_patch_free')
     .asFunction<void Function(int)>();
+
+// Zero-copy *_into bindings — one pair per session type. All share the same
+// signature so we type the Dart side once and bind by symbol name.
+
+typedef _DartFeedInto = int Function(
+  int,
+  ffi.Pointer<ffi.Uint8>, int,
+  ffi.Pointer<ffi.Uint8>, int,
+  ffi.Pointer<ffi.Size>,
+  ffi.Pointer<ffi.Int32>,
+);
+typedef _DartEndInto = int Function(
+  int,
+  ffi.Pointer<ffi.Uint8>, int,
+  ffi.Pointer<ffi.Size>,
+  ffi.Pointer<ffi.Int32>,
+);
+
+final _DartFeedInto _signatureFeedInto = _lib
+    .lookup<ffi.NativeFunction<_NativeFeedInto>>('librsync_signature_feed_into')
+    .asFunction<_DartFeedInto>();
+final _DartEndInto _signatureEndInto = _lib
+    .lookup<ffi.NativeFunction<_NativeEndInto>>('librsync_signature_end_into')
+    .asFunction<_DartEndInto>();
+
+final _DartFeedInto _deltaFeedInto = _lib
+    .lookup<ffi.NativeFunction<_NativeFeedInto>>('librsync_delta_feed_into')
+    .asFunction<_DartFeedInto>();
+final _DartEndInto _deltaEndInto = _lib
+    .lookup<ffi.NativeFunction<_NativeEndInto>>('librsync_delta_end_into')
+    .asFunction<_DartEndInto>();
+
+final _DartFeedInto _patchFeedInto = _lib
+    .lookup<ffi.NativeFunction<_NativeFeedInto>>('librsync_patch_feed_into')
+    .asFunction<_DartFeedInto>();
+final _DartEndInto _patchEndInto = _lib
+    .lookup<ffi.NativeFunction<_NativeEndInto>>('librsync_patch_end_into')
+    .asFunction<_DartEndInto>();
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -486,6 +544,69 @@ Uint8List patchEndHandle(int handle) {
 }
 
 void patchFreeHandle(int handle) => _patchFree(handle);
+
+// ─── Zero-copy *Into helpers ──────────────────────────────────────────────────
+//
+// All write the number of bytes copied into dst at [bytesWritten] and a 0/1
+// flag at [morePending]. The handle stays valid until End*Into returns
+// morePending=0 (at which point Go drops it).
+
+void signatureFeedIntoHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> inputPtr, int inputLen,
+  ffi.Pointer<ffi.Uint8> dstPtr, int dstLen,
+  ffi.Pointer<ffi.Size> bytesWritten,
+  ffi.Pointer<ffi.Int32> morePending,
+) =>
+    checkReturn(_signatureFeedInto(
+        handle, inputPtr, inputLen, dstPtr, dstLen, bytesWritten, morePending));
+
+void signatureEndIntoHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> dstPtr, int dstLen,
+  ffi.Pointer<ffi.Size> bytesWritten,
+  ffi.Pointer<ffi.Int32> morePending,
+) =>
+    checkReturn(
+        _signatureEndInto(handle, dstPtr, dstLen, bytesWritten, morePending));
+
+void deltaFeedIntoHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> inputPtr, int inputLen,
+  ffi.Pointer<ffi.Uint8> dstPtr, int dstLen,
+  ffi.Pointer<ffi.Size> bytesWritten,
+  ffi.Pointer<ffi.Int32> morePending,
+) =>
+    checkReturn(_deltaFeedInto(
+        handle, inputPtr, inputLen, dstPtr, dstLen, bytesWritten, morePending));
+
+void deltaEndIntoHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> dstPtr, int dstLen,
+  ffi.Pointer<ffi.Size> bytesWritten,
+  ffi.Pointer<ffi.Int32> morePending,
+) =>
+    checkReturn(
+        _deltaEndInto(handle, dstPtr, dstLen, bytesWritten, morePending));
+
+void patchFeedIntoHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> deltaPtr, int deltaLen,
+  ffi.Pointer<ffi.Uint8> dstPtr, int dstLen,
+  ffi.Pointer<ffi.Size> bytesWritten,
+  ffi.Pointer<ffi.Int32> morePending,
+) =>
+    checkReturn(_patchFeedInto(
+        handle, deltaPtr, deltaLen, dstPtr, dstLen, bytesWritten, morePending));
+
+void patchEndIntoHandle(
+  int handle,
+  ffi.Pointer<ffi.Uint8> dstPtr, int dstLen,
+  ffi.Pointer<ffi.Size> bytesWritten,
+  ffi.Pointer<ffi.Int32> morePending,
+) =>
+    checkReturn(
+        _patchEndInto(handle, dstPtr, dstLen, bytesWritten, morePending));
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 

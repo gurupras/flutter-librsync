@@ -37,6 +37,10 @@ final class SigHandle {
 
   SigHandle._(this._handle);
 
+  /// Internal: raw native handle for use by sibling session classes.
+  /// Not part of the public API — do not call from outside the package.
+  int get internalHandle => _handle;
+
   /// Parses [sigBytes] into an in-memory lookup structure.
   ///
   /// The library copies the input — [sigBytes] may be freed immediately after.
@@ -71,6 +75,9 @@ final class SigHandle {
 /// [end] flushes any remaining output and invalidates the session.
 ///
 /// On an error path (before [end] is called), call [close] to release resources.
+///
+/// **Deprecated:** prefer [SignatureSession] (zero-copy + cleaner API) or
+/// the `Stream<Uint8List>.rsyncSignature()` extension for stream pipelines.
 ///
 /// ```dart
 /// final stream = SignatureStream();
@@ -123,6 +130,42 @@ final class SignatureStream {
   /// The caller retains ownership of [ptr] — this method never frees it.
   Uint8List feedPtr(ffi.Pointer<ffi.Uint8> ptr, int length) =>
       b.signatureFeedHandle(_handle, ptr, length);
+
+  /// Fully zero-copy feed: writes any output directly into [dst] (capacity
+  /// [dstLen]) and returns the number of bytes written. [bytesWrittenPtr] is a
+  /// caller-provided `size_t` scratch slot used to receive the count from
+  /// native code (allocate once with `calloc<Size>()` and reuse).
+  /// [morePendingPtr] is an `int32_t` scratch slot that is set to 1 iff
+  /// output remains buffered internally; drain by re-calling with
+  /// `inputLen: 0` until it is 0.
+  ///
+  /// All five pointers belong to the caller; this method never allocates.
+  @Deprecated('Use SignatureSession (lib/src/sessions.dart) for the clean API.')
+  int feedInto(
+    ffi.Pointer<ffi.Uint8> inputPtr, int inputLen,
+    ffi.Pointer<ffi.Uint8> dst, int dstLen,
+    ffi.Pointer<ffi.Size> bytesWrittenPtr,
+    ffi.Pointer<ffi.Int32> morePendingPtr,
+  ) {
+    b.signatureFeedIntoHandle(
+        _handle, inputPtr, inputLen, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+    return bytesWrittenPtr.value;
+  }
+
+  /// Fully zero-copy end: drains the final output into [dst] in [dstLen]-sized
+  /// chunks. Call repeatedly until [morePendingPtr] reads 0. The handle is
+  /// dropped on the call that sets [morePendingPtr] to 0; do not call [close]
+  /// after that.
+  @Deprecated('Use SignatureSession (lib/src/sessions.dart) for the clean API.')
+  int endInto(
+    ffi.Pointer<ffi.Uint8> dst, int dstLen,
+    ffi.Pointer<ffi.Size> bytesWrittenPtr,
+    ffi.Pointer<ffi.Int32> morePendingPtr,
+  ) {
+    b.signatureEndIntoHandle(_handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+    if (morePendingPtr.value == 0) _ended = true;
+    return bytesWrittenPtr.value;
+  }
 
   /// Finalises the session and returns any remaining output.
   ///
@@ -198,6 +241,31 @@ final class DeltaStream {
   /// The caller retains ownership of [ptr] — this method never frees it.
   Uint8List feedPtr(ffi.Pointer<ffi.Uint8> ptr, int length) =>
       b.deltaFeedHandle(_handle, ptr, length);
+
+  /// Fully zero-copy feed. See [SignatureStream.feedInto] for semantics.
+  @Deprecated('Use DeltaSession (lib/src/sessions.dart) for the clean API.')
+  int feedInto(
+    ffi.Pointer<ffi.Uint8> inputPtr, int inputLen,
+    ffi.Pointer<ffi.Uint8> dst, int dstLen,
+    ffi.Pointer<ffi.Size> bytesWrittenPtr,
+    ffi.Pointer<ffi.Int32> morePendingPtr,
+  ) {
+    b.deltaFeedIntoHandle(
+        _handle, inputPtr, inputLen, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+    return bytesWrittenPtr.value;
+  }
+
+  /// Fully zero-copy end. See [SignatureStream.endInto] for semantics.
+  @Deprecated('Use DeltaSession (lib/src/sessions.dart) for the clean API.')
+  int endInto(
+    ffi.Pointer<ffi.Uint8> dst, int dstLen,
+    ffi.Pointer<ffi.Size> bytesWrittenPtr,
+    ffi.Pointer<ffi.Int32> morePendingPtr,
+  ) {
+    b.deltaEndIntoHandle(_handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+    if (morePendingPtr.value == 0) _ended = true;
+    return bytesWrittenPtr.value;
+  }
 
   /// Finalises the session and flushes all remaining output.
   ///
@@ -354,6 +422,41 @@ final class PatchStream {
     } finally {
       calloc.free(ptr);
     }
+  }
+
+  /// Zero-copy variant of [feed] for callers managing their own C-heap buffers.
+  ///
+  /// [ptr] must remain valid and unmodified until this call returns.
+  /// The caller retains ownership of [ptr] — this method never frees it.
+  Uint8List feedPtr(ffi.Pointer<ffi.Uint8> ptr, int length) =>
+      b.patchFeedHandle(_handle, ptr, length);
+
+  /// Fully zero-copy feed. See [SignatureStream.feedInto] for semantics.
+  @Deprecated('Use PatchSession (lib/src/sessions.dart) for the clean API.')
+  int feedInto(
+    ffi.Pointer<ffi.Uint8> deltaPtr, int deltaLen,
+    ffi.Pointer<ffi.Uint8> dst, int dstLen,
+    ffi.Pointer<ffi.Size> bytesWrittenPtr,
+    ffi.Pointer<ffi.Int32> morePendingPtr,
+  ) {
+    b.patchFeedIntoHandle(
+        _handle, deltaPtr, deltaLen, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+    return bytesWrittenPtr.value;
+  }
+
+  /// Fully zero-copy end. See [SignatureStream.endInto] for semantics.
+  @Deprecated('Use PatchSession (lib/src/sessions.dart) for the clean API.')
+  int endInto(
+    ffi.Pointer<ffi.Uint8> dst, int dstLen,
+    ffi.Pointer<ffi.Size> bytesWrittenPtr,
+    ffi.Pointer<ffi.Int32> morePendingPtr,
+  ) {
+    b.patchEndIntoHandle(_handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+    if (morePendingPtr.value == 0) {
+      _ended = true;
+      _teardown();
+    }
+    return bytesWrittenPtr.value;
   }
 
   /// Finalises the session and returns any remaining reconstructed bytes.
