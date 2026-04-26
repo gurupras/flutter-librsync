@@ -12,6 +12,15 @@ export 'implementations.dart';
 export 'ffi/bindings.dart' show LibrsyncException;
 export 'streaming.dart'
     show SigHandle, SignatureStream, DeltaStream, PatchStream, defaultChunkSize;
+export 'sessions.dart'
+    show
+        RsyncBuffer,
+        RsyncOnChunk,
+        SignatureSession,
+        DeltaSession,
+        PatchSession,
+        defaultOutputCapacity;
+export 'streams.dart' show RsyncStreamOps, RsyncStreams, defaultStreamChunkSize;
 
 /// The BLAKE2 signature magic number (preferred, default).
 const int blake2SigMagic = 0x72730137;
