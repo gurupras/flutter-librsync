@@ -111,15 +111,21 @@ extern intptr_t librsync_signature_new(uint32_t blockLen, uint32_t strongLen, ui
 extern int32_t librsync_signature_feed(intptr_t handle, uint8_t* inputPtr, size_t inputLen, uint8_t** outPtr, size_t* outLen);
 extern int32_t librsync_signature_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
 extern void librsync_signature_free(intptr_t handle);
+extern int32_t librsync_signature_feed_into(intptr_t handle, uint8_t* inputPtr, size_t inputLen, uint8_t* dstPtr, size_t dstLen, size_t* bytesWritten, int32_t* morePending);
+extern int32_t librsync_signature_end_into(intptr_t handle, uint8_t* dstPtr, size_t dstLen, size_t* bytesWritten, int32_t* morePending);
 extern intptr_t librsync_delta_new(intptr_t sigHandle);
 extern int32_t librsync_delta_feed(intptr_t handle, uint8_t* inputPtr, size_t inputLen, uint8_t** outPtr, size_t* outLen);
 extern int32_t librsync_delta_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
+extern int32_t librsync_delta_feed_into(intptr_t handle, uint8_t* inputPtr, size_t inputLen, uint8_t* dstPtr, size_t dstLen, size_t* bytesWritten, int32_t* morePending);
+extern int32_t librsync_delta_end_into(intptr_t handle, uint8_t* dstPtr, size_t dstLen, size_t* bytesWritten, int32_t* morePending);
 extern void librsync_delta_free(intptr_t handle);
 extern intptr_t librsync_patch_new(rs_read_seeker_t* rs);
 extern intptr_t librsync_patch_new_buf(uint8_t* dataPtr, size_t dataLen);
 extern intptr_t librsync_patch_new_path(char* path);
 extern int32_t librsync_patch_feed(intptr_t handle, uint8_t* deltaPtr, size_t deltaLen, uint8_t** outPtr, size_t* outLen);
 extern int32_t librsync_patch_end(intptr_t handle, uint8_t** outPtr, size_t* outLen);
+extern int32_t librsync_patch_feed_into(intptr_t handle, uint8_t* deltaPtr, size_t deltaLen, uint8_t* dstPtr, size_t dstLen, size_t* bytesWritten, int32_t* morePending);
+extern int32_t librsync_patch_end_into(intptr_t handle, uint8_t* dstPtr, size_t dstLen, size_t* bytesWritten, int32_t* morePending);
 extern void librsync_patch_free(intptr_t handle);
 
 #ifdef __cplusplus
