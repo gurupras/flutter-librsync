@@ -3,6 +3,7 @@
 
 import 'dart:ffi' as ffi;
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -696,6 +697,172 @@ void main() {
 
       expect(streamResult, equals(modified));
       expect(batchResult, equals(modified));
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Concurrent FFI stress
+  //
+  // Field reports of an Android crash inside
+  //   _cgoexp_..._librsync_sig_parse
+  // with "unexpected return pc for runtime.cgocallback" surface when callers
+  // wrap every librsync call in `Isolate.run(...)`, spawning a fresh isolate
+  // (and therefore a fresh OS thread) per call.  When several files are
+  // processed concurrently, multiple isolates enter the same Go shared
+  // library through cgo simultaneously — each on its own fixed-size 8 KB g0
+  // stack.  These tests reproduce that pattern at small file size so we can
+  // isolate whether the failure is concurrency-driven (independent of
+  // signature size) or strictly size-driven.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('Concurrent FFI stress (small file, many isolates)', () {
+    test('N parallel SigHandle.fromBytes calls all succeed', () async {
+      // ~1 MB pseudo-random basis: large enough that ParseSignature has real
+      // work (~256 blocks @ 4096 default block size) but tiny on disk.
+      final basis = Uint8List(1 * 1024 * 1024);
+      for (int i = 0; i < basis.length; i++) {
+        basis[i] = (i * 1103515245 + 12345) & 0xFF;
+      }
+      final sigBytes = await Librsync.signatureBytes(basis);
+
+      // Several rounds; each round spawns N isolates, each calling
+      // SigHandle.fromBytes once and exercising the resulting handle.
+      // Multiple rounds raise the chance of catching a thread-affinity race.
+      const concurrency = 16;
+      const rounds = 4;
+      for (int round = 0; round < rounds; round++) {
+        final results = await Future.wait<bool>([
+          for (int i = 0; i < concurrency; i++)
+            Isolate.run<bool>(() {
+              final h = SigHandle.fromBytes(sigBytes);
+              try {
+                // Touch the parsed sig — DeltaStream construction validates
+                // the handle was produced correctly.
+                final ds = DeltaStream(h);
+                ds.feed(Uint8List(64));
+                ds.end();
+                return true;
+              } finally {
+                h.close();
+              }
+            }),
+        ]);
+        expect(results.every((ok) => ok), isTrue,
+            reason: 'round $round: all $concurrency parallel sig-parses '
+                'must succeed — failure here reproduces the LAN crash');
+      }
+    });
+
+    test('mixed signature/delta/patch isolates do not crash the FFI', () async {
+      // Mirrors the production call shape: receiver computes signatures and
+      // applies patches while sender computes deltas — concurrently across
+      // multiple files.
+      final basis = Uint8List(512 * 1024);
+      for (int i = 0; i < basis.length; i++) {
+        basis[i] = (i * 2654435761) & 0xFF;
+      }
+      final modified = Uint8List.fromList(basis);
+      // Diverge ~10% of bytes so delta is non-trivial.
+      for (int i = 0; i < modified.length; i += 10) {
+        modified[i] = modified[i] ^ 0xFF;
+      }
+
+      const fanout = 8;
+      final futures = <Future<({String kind, bool ok, String? failReason})>>[];
+      for (int i = 0; i < fanout; i++) {
+        futures.add(Isolate.run(() async {
+          try {
+            final sig = await Librsync.signatureBytes(basis);
+            return (
+              kind: 'sig',
+              ok: sig.isNotEmpty,
+              failReason: sig.isEmpty ? 'sig empty' : null
+            );
+          } catch (e) {
+            return (kind: 'sig', ok: false, failReason: 'threw: $e');
+          }
+        }));
+        futures.add(Isolate.run(() async {
+          try {
+            final sig = await Librsync.signatureBytes(basis);
+            final delta = await Librsync.deltaBytes(sig, modified);
+            return (
+              kind: 'delta',
+              ok: delta.isNotEmpty,
+              failReason: delta.isEmpty ? 'delta empty' : null
+            );
+          } catch (e) {
+            return (kind: 'delta', ok: false, failReason: 'threw: $e');
+          }
+        }));
+        futures.add(Isolate.run(() async {
+          try {
+            final sig = await Librsync.signatureBytes(basis);
+            final delta = await Librsync.deltaBytes(sig, modified);
+            final patched = await Librsync.patchBytes(basis, delta);
+            // Compare lengths in-isolate; sending the full bytes back as a
+            // result is fine for 512 KB.
+            final ok = patched.length == modified.length;
+            return (
+              kind: 'patch',
+              ok: ok,
+              failReason: ok ? null : 'patched=${patched.length} expected=${modified.length}'
+            );
+          } catch (e) {
+            return (kind: 'patch', ok: false, failReason: 'threw: $e');
+          }
+        }));
+      }
+      final results = await Future.wait(futures);
+      final failures = results.where((r) => !r.ok).toList();
+      expect(failures, isEmpty,
+          reason: 'concurrent FFI calls must not crash or fail; '
+              'failures: ${failures.map((f) => "${f.kind}: ${f.failReason}").join(", ")}');
+    });
+
+    // The class of crash above can also depend on signature size: a 4 GB
+    // file at blockLen=4096 produces a ~24 MB signature and ParseSignature
+    // walks ~1M block entries.  Cgo's per-thread g0 stack on Android is
+    // small (8 KB observed).  This test pushes signature size up *in memory
+    // only* (no disk) to isolate whether it's signature size, not just
+    // concurrency, that triggers "unexpected return pc for runtime.cgocallback".
+    test('large in-memory signature parsed concurrently does not crash',
+        () async {
+      // 64 MB basis → ~16K blocks at default blockLen → ~400 KB signature.
+      // Big enough to multiply parser work an order of magnitude over the
+      // 1 MB test above; small enough to not bloat the harness.
+      const basisLen = 64 * 1024 * 1024;
+      final basis = Uint8List(basisLen);
+      // Cheap deterministic fill — random-ish bytes so the signature is
+      // representative of file content rather than all-zeros.
+      var x = 0xDEADBEEF;
+      for (int i = 0; i < basisLen; i++) {
+        x = (x * 1664525 + 1013904223) & 0xFFFFFFFF;
+        basis[i] = x & 0xFF;
+      }
+      final sigBytes = await Librsync.signatureBytes(basis);
+
+      const concurrency = 8;
+      final results = await Future.wait<bool>([
+        for (int i = 0; i < concurrency; i++)
+          Isolate.run<bool>(() {
+            final h = SigHandle.fromBytes(sigBytes);
+            try {
+              final ds = DeltaStream(h);
+              ds.feed(Uint8List(64));
+              ds.end();
+              return true;
+            } catch (_) {
+              return false;
+            } finally {
+              h.close();
+            }
+          }),
+      ]);
+      expect(results.every((ok) => ok), isTrue,
+          reason: '$concurrency concurrent parses of a ~400 KB signature '
+              'must succeed; failure here points to signature-size-driven '
+              'cgo stack issues');
     });
   });
 }
