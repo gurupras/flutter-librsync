@@ -9,7 +9,7 @@ import 'streaming.dart';
 
 export 'interfaces.dart';
 export 'implementations.dart';
-export 'ffi/bindings.dart' show LibrsyncException;
+export 'ffi/bindings.dart' show LibrsyncException, setLibraryPath;
 export 'streaming.dart'
     show SigHandle, SignatureStream, DeltaStream, PatchStream, defaultChunkSize;
 export 'sessions.dart'

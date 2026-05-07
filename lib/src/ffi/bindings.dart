@@ -114,17 +114,65 @@ typedef _NativeEndInto = ffi.Int32 Function(
 );
 
 // ─── Library loader ───────────────────────────────────────────────────────────
+//
+// librsync symbols are bundled in libfilemingo_native (the combined Go shared
+// library for the Filemingo app).  On iOS they are statically linked into the
+// host binary; DynamicLibrary.process() is used there.
+//
+// On Android, Isolate.run closures execute on raw Dart VM threads that lack
+// the app's ClassLoader linker namespace, so dlopen(soname) fails on those
+// threads.  _openAndroid() self-resolves by reading /proc/self/maps: since
+// the persistent Isolate.spawn worker already loaded the library, its full
+// path appears in the map and we can open it directly.
+//
+// setLibraryPath() is retained as an escape hatch (e.g. unit-test overrides
+// pointing at a standalone libflutter_librsync.so) but is not required for
+// normal Filemingo app use.
+
+const _kLibName = 'filemingo_native';
+
+String? _libOverridePath;
+
+/// Override the library path.  Not required for normal Filemingo app use;
+/// kept as an escape hatch for test environments or non-standard deployments.
+void setLibraryPath(String path) => _libOverridePath = path;
 
 ffi.DynamicLibrary _openLib() {
-  const name = 'flutter_librsync';
   if (Platform.isIOS) return ffi.DynamicLibrary.process();
-  if (Platform.isMacOS) return ffi.DynamicLibrary.open('lib$name.dylib');
-  if (Platform.isAndroid || Platform.isLinux) {
-    return ffi.DynamicLibrary.open('lib$name.so');
-  }
-  if (Platform.isWindows) return ffi.DynamicLibrary.open('$name.dll');
+
+  final override = _libOverridePath;
+  if (override != null) return ffi.DynamicLibrary.open(override);
+
+  if (Platform.isAndroid) return _openAndroid();
+  if (Platform.isMacOS) return ffi.DynamicLibrary.open('lib$_kLibName.dylib');
+  if (Platform.isLinux) return ffi.DynamicLibrary.open('lib$_kLibName.so');
+  if (Platform.isWindows) return ffi.DynamicLibrary.open('$_kLibName.dll');
   throw UnsupportedError(
       'flutter_librsync: unsupported platform ${Platform.operatingSystem}');
+}
+
+/// Opens lib[_kLibName].so on Android.
+///
+/// Tries dlopen(soname) first — works on ClassLoader-backed threads
+/// (Isolate.spawn).  Falls back to an absolute-path lookup via /proc/self/maps
+/// for Isolate.run closures on raw Dart VM threads where the ClassLoader
+/// namespace is unavailable.
+ffi.DynamicLibrary _openAndroid() {
+  const soname = 'lib$_kLibName.so';
+  try {
+    return ffi.DynamicLibrary.open(soname);
+  } catch (_) {}
+  try {
+    final maps = File('/proc/self/maps').readAsStringSync();
+    for (final line in maps.split('\n')) {
+      if (!line.contains(soname)) continue;
+      final parts = line.trim().split(RegExp(r'\s+'));
+      if (parts.length >= 6) return ffi.DynamicLibrary.open(parts.last);
+    }
+  } catch (_) {}
+  throw UnsupportedError(
+      'flutter_librsync: could not open $soname on Android — '
+      'ensure libfilemingo_native.so is loaded before any librsync call');
 }
 
 final _lib = _openLib();
