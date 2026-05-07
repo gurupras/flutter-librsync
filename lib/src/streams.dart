@@ -167,7 +167,7 @@ Stream<Uint8List> _readFile(File file, int chunkSize) async* {
   try {
     int n;
     while ((n = raf.readIntoSync(buf)) > 0) {
-      yield Uint8List.sublistView(buf, 0, n).sublist(0);
+      yield buf.sublist(0, n);
     }
   } finally {
     raf.closeSync();
