@@ -33,8 +33,16 @@ add_custom_target(flutter_librsync_go ALL DEPENDS "${PREBUILT_LIB}")
 add_library(flutter_librsync INTERFACE)
 add_dependencies(flutter_librsync flutter_librsync_go)
 
-# Tell Flutter to bundle the prebuilt .so alongside the application.
-set(flutter_librsync_bundled_libraries
-  "${PREBUILT_LIB}"
-  PARENT_SCOPE
-)
+# Allow the consuming app to opt out of bundling the .so (e.g. when the app
+# ships its own combined native library that already includes librsync).
+# Set FLUTTER_LIBRSYNC_SKIP_BUNDLE=ON in the app's CMakeLists.txt before
+# including the plugin to suppress the install rule without touching this file.
+option(FLUTTER_LIBRSYNC_SKIP_BUNDLE
+  "Do not add libflutter_librsync.so to the Flutter bundle" OFF)
+
+if(NOT FLUTTER_LIBRSYNC_SKIP_BUNDLE)
+  set(flutter_librsync_bundled_libraries
+    "${PREBUILT_LIB}"
+    PARENT_SCOPE
+  )
+endif()
