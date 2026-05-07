@@ -162,9 +162,18 @@ final class SignatureStream {
     ffi.Pointer<ffi.Size> bytesWrittenPtr,
     ffi.Pointer<ffi.Int32> morePendingPtr,
   ) {
-    b.signatureEndIntoHandle(_handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
-    if (morePendingPtr.value == 0) _ended = true;
-    return bytesWrittenPtr.value;
+    var nativeReturned = false;
+    try {
+      b.signatureEndIntoHandle(
+          _handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+      nativeReturned = true;
+      return bytesWrittenPtr.value;
+    } finally {
+      // Go's signature_end_into drops the handle on error and on the final
+      // morePending=0 call. Mark _ended in either case so close() is a no-op
+      // rather than a redundant free against an already-dropped handle.
+      if (!nativeReturned || morePendingPtr.value == 0) _ended = true;
+    }
   }
 
   /// Finalises the session and returns any remaining output.
@@ -262,9 +271,17 @@ final class DeltaStream {
     ffi.Pointer<ffi.Size> bytesWrittenPtr,
     ffi.Pointer<ffi.Int32> morePendingPtr,
   ) {
-    b.deltaEndIntoHandle(_handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
-    if (morePendingPtr.value == 0) _ended = true;
-    return bytesWrittenPtr.value;
+    var nativeReturned = false;
+    try {
+      b.deltaEndIntoHandle(
+          _handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+      nativeReturned = true;
+      return bytesWrittenPtr.value;
+    } finally {
+      // Go's delta_end_into drops the handle on error and on the final
+      // morePending=0 call. Mark _ended in either case so close() is a no-op.
+      if (!nativeReturned || morePendingPtr.value == 0) _ended = true;
+    }
   }
 
   /// Finalises the session and flushes all remaining output.
@@ -451,12 +468,21 @@ final class PatchStream {
     ffi.Pointer<ffi.Size> bytesWrittenPtr,
     ffi.Pointer<ffi.Int32> morePendingPtr,
   ) {
-    b.patchEndIntoHandle(_handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
-    if (morePendingPtr.value == 0) {
-      _ended = true;
-      _teardown();
+    var nativeReturned = false;
+    try {
+      b.patchEndIntoHandle(
+          _handle, dst, dstLen, bytesWrittenPtr, morePendingPtr);
+      nativeReturned = true;
+      return bytesWrittenPtr.value;
+    } finally {
+      // Go's patch_end_into drops the handle on error and on the final
+      // morePending=0 call. Mirror that here: mark _ended and tear down the
+      // Dart-side callback/seeker allocations so close() is a no-op.
+      if (!nativeReturned || morePendingPtr.value == 0) {
+        _ended = true;
+        _teardown();
+      }
     }
-    return bytesWrittenPtr.value;
   }
 
   /// Finalises the session and returns any remaining reconstructed bytes.
