@@ -16,7 +16,10 @@ Pod::Spec.new do |s|
   # The Makefile is idempotent (skips rebuild when the .a is up to date).
   s.prepare_command  = <<-CMD
     set -e
-    PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    # CocoaPods runs this via `/bin/bash -c`, so $0 = /bin/bash, not the podspec.
+    # CWD is the pod root. If the Makefile isn't there, check one level up (ios/ subdir case).
+    PLUGIN_ROOT="$(pwd)"
+    [ -f "$PLUGIN_ROOT/Makefile" ] || PLUGIN_ROOT="$(cd "$PLUGIN_ROOT/.." && pwd)"
     if ! command -v make >/dev/null 2>&1; then
       echo "WARNING: make not found; skipping Go iOS build."
       exit 0
@@ -36,8 +39,5 @@ Pod::Spec.new do |s|
   s.pod_target_xcconfig = {
     'DEFINES_MODULE'                     => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    # The static library contains Go runtime symbols; tell the linker to allow
-    # duplicate symbols from the Go runtime across compilation units.
-    'OTHER_LDFLAGS'                      => '-Wl,-allow_stack_execute',
   }
 end
