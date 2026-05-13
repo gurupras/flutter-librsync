@@ -22,7 +22,7 @@ import (
 	"io"
 	"unsafe"
 
-	"github.com/gurupras/flutter-librsync/librsync"
+	"github.com/gurupras/flutter-librsync/go/librsync"
 )
 
 func main() {}

@@ -1,4 +1,4 @@
-module github.com/gurupras/flutter-librsync
+module github.com/gurupras/flutter-librsync/go
 
 go 1.21
 
